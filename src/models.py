@@ -61,9 +61,9 @@ class GNNMLP(nn.Module):
 
 
 class GNNComplete(nn.Module):
-    def __init__(self, backbone: nn.Module, mlp: GNNMLP) -> None:
+    def __init__(self, backbone: GCNBackbone | SageBackbone, mlp: GNNMLP) -> None:
         super(GNNComplete, self).__init__()
-        self.backbone: nn.Module = backbone
+        self.backbone: GCNBackbone | SageBackbone = backbone
         self.mlp: GNNMLP = mlp
 
     def forward(self, data: Data) -> Tensor:

@@ -227,13 +227,16 @@ def merge_model(model1, model2, model3_backbone, dataset, num_layers,
         
         
         # Print progress
-        print(f"Epoch {epoch}/{num_epochs-1}:")
-        print(f"Train1: {train_acc1:.4f}, Val: {val_acc1:.4f}, Test: {test_acc1:.4f}")
-        print(f"Train2: {train_acc2:.4f}, Val: {val_acc2:.4f}, Test: {test_acc2:.4f}")
-        print(f"Epoch time: {epoch_time:.2f}s")
+        # print(f"Epoch {epoch}/{num_epochs-1}:")
+        # print(f"Train1: {train_acc1:.4f}, Val: {val_acc1:.4f}, Test: {test_acc1:.4f}")
+        # print(f"Train2: {train_acc2:.4f}, Val: {val_acc2:.4f}, Test: {test_acc2:.4f}")
+        # print(f"Epoch time: {epoch_time:.2f}s")
         
         # Print best accuracies every 50 epochs
         if (epoch + 1) % 50 == 0:
+            print(f"Epoch {epoch}/{num_epochs-1}:")
+            print(f"Train1: {train_acc1:.4f}, Val: {val_acc1:.4f}, Test: {test_acc1:.4f}")
+            print(f"Train2: {train_acc2:.4f}, Val: {val_acc2:.4f}, Test: {test_acc2:.4f}")
             print(f"Average epoch time: {total_time/(epoch+1):.2f}s")
             print("-" * 50)
     
@@ -244,6 +247,9 @@ def merge_model(model1, model2, model3_backbone, dataset, num_layers,
     log_file = os.path.join(logs_path, f'{dataset_name}_{model_name}_{timestamp}.json')
     with open(log_file, 'w') as f:
         json.dump(logs, f, indent=4)
+
+    # TODO: change this name!!!
+    torch.save(model3_backbone.state_dict(), "artifacts/models/gnnmerge_ogbn_arxiv_sage_backbone.pt")
     
     return logs
 
@@ -252,7 +258,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Load dataset
-    dataset = torch.load(args.data_path, map_location="cpu")
+    dataset = torch.load(args.data_path, map_location="cpu", weights_only=False)
     dataset = dataset.to(device)
     
     # Initialize models

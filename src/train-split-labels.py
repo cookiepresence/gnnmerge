@@ -8,8 +8,7 @@ Usage (example):
         --model gcn \
         --data-path /path/to/dataset.pt \
         --model1-save /path/to/model1.pt \
-        --model2-save /path/to/model2.pt \
-        --logs-dir /path/to/logs
+        --model2-save /path/to/model2.pt
 """
 
 import json
@@ -17,8 +16,10 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any, Literal
 import random
+
+from ogb.nodeproppred import PygNodePropPredDataset
 
 import torch
 import torch.nn as nn
@@ -26,6 +27,7 @@ import numpy as np
 import wandb
 
 from models import GCNBackbone, GNNComplete, GNNMLP, SageBackbone
+import utils as utils
 
 # fix for https://github.com/snap-stanford/ogb/issues/497
 ###
@@ -53,7 +55,8 @@ LOG_TIME_FORMAT = "%Y%m%d_%H%M%S"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+
+datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("label-split-train")
 
@@ -86,35 +89,16 @@ def load_dataset(path: Path):
     return ds, num_nodes, num_labels, input_dim
 
 
-def build_models(
-        model_name: str, input_dim: int, num_labels: int, device: torch.device,
-        hidden_dim: int = HIDDEN_DIM, lr: float = LR, weight_decay: float = WEIGHT_DECAY
-) -> tuple[torch.nn.Module, torch.nn.Module, torch.optim.Optimizer, torch.optim.Optimizer, nn.Module]:
-    """
-    Construct two models for the label split, optimizers and criterion.
-    """
-    if model_name == "gcn":
-        b1 = GCNBackbone(input_dim, hidden_dim).to(device)
-        b2 = GCNBackbone(input_dim, hidden_dim).to(device)
-    elif model_name == "sage":
-        b1 = SageBackbone(input_dim, hidden_dim).to(device)
-        b2 = SageBackbone(input_dim, hidden_dim).to(device)
-    else:
-        raise ValueError(f"Unknown model type: {model_name!r}")
-
-    # split labels between two MLP heads
-    head1_out = (num_labels + 1) // 2
-    head2_out = num_labels // 2
-
-    m1 = GNNComplete(b1, GNNMLP(hidden_dim, head1_out)).to(device)
-    m2 = GNNComplete(b2, GNNMLP(hidden_dim, head2_out)).to(device)
-
-    opt1 = torch.optim.Adam(m1.parameters(), lr=lr, weight_decay=weight_decay)
-    opt2 = torch.optim.Adam(m2.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = nn.CrossEntropyLoss()
-
-    return m1, m2, opt1, opt2, criterion
-
+def save(path: Path, model: Optional[torch.nn.Module]=None, metadata: Optional[dict[str, Any]]=None, logs: Optional[dict]=None):
+    path.mkdir(parents=True, exist_ok=True)
+    if model is not None:
+        torch.save(model.state_dict(), path / "model.pt")
+    if metadata is not None:
+        metadata_file = path / "metadata.json"
+        metadata_file.write_text(json.dumps(metadata, indent=2))
+    if logs is not None:
+        log_file = path / "logs.json"
+        log_file.write_text(json.dumps(logs, indent=2))
 
 MaskType = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 ClassType = tuple[set[int], set[int]]
@@ -194,6 +178,8 @@ def evaluate(model: torch.nn.Module, data, mask: torch.Tensor, criterion) -> tup
 def train_model(
     model_id: int,
     model: torch.nn.Module,
+    input_dim: int,
+    labels: int,
     data,
     train_mask: torch.Tensor,
     val_mask: torch.Tensor,
@@ -203,40 +189,43 @@ def train_model(
     dataset_name: str,
     model_name: str,
     ckpt_path: Path,
-    logs_dir: Path,
     num_epochs: int,
     hidden_dim: int,
     lr: float,
     weight_decay: float,
     wandb_project: str,
     seed: int
-) -> dict:
+):
     """
     Train one model and save the best checkpoint based on validation accuracy.
     Returns the logs dictionary.
     """
     timestamp = datetime.now().strftime(LOG_TIME_FORMAT)
 
+    ckpt_path = ckpt_path
+    config = {
+        "model_id": model_id,
+        "dataset": dataset_name,
+        "model_type": model_name,
+        "input_dim": input_dim,
+        "hidden_dim": hidden_dim,
+        "num_labels": labels,
+        "learning_rate": lr,
+        "weight_decay": weight_decay,
+        "num_epochs": num_epochs,
+        "train_nodes": train_mask.sum().item(),
+        "val_nodes": val_mask.sum().item(),
+        "test_nodes": test_mask.sum().item(),
+        "seed": seed
+    }
+
     _ = wandb.init(
             project=wandb_project,
             name=f"{dataset_name}_{model_name}_model{model_id}",
-            config={
-                "model_id": model_id,
-                "dataset": dataset_name,
-                "model_type": model_name,
-                "hidden_dim": hidden_dim,
-                "learning_rate": lr,
-                "weight_decay": weight_decay,
-                "num_epochs": num_epochs,
-                "train_nodes": train_mask.sum().item(),
-                "val_nodes": val_mask.sum().item(),
-                "test_nodes": test_mask.sum().item(),
-                "seed": seed
-            }
+            config=config
         )
 
     logs: dict[str, str | float | list[float] | Optional[int]] = {
-        "model_name": f"{dataset_name}_{model_name}_{model_id}",
         "epochs": [],
         "train_acc": [],
         "val_acc": [],
@@ -254,10 +243,7 @@ def train_model(
     best_val_acc = 0.0
     total_time = 0.0
 
-    logger.info("Starting training for model %d (%s)", model_id, logs["model_name"])
-
-    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Starting training for model %d (%s)", model_id, config["model_type"])
 
     for epoch in range(num_epochs):
         epoch_start = time.time()
@@ -295,15 +281,12 @@ def train_model(
             logs["best_epoch"] = epoch
             logs["best_val_acc"] = val_acc
             logs["best_test_acc"] = test_acc
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "val_acc": val_acc,
-                    "test_acc": test_acc,
-                    "epoch": epoch,
-                },
-                str(ckpt_path),
-            )
+
+            config['epoch'] = epoch
+            config['val_acc'] = val_acc
+            config['test_acc'] = test_acc
+
+            save(ckpt_path, model=model, metadata=config, logs=None)
             logger.info("Saved best checkpoint for model %d to %s (val_acc=%.4f, test_acc=%.4f)", model_id, ckpt_path, val_acc, test_acc)
 
         if (epoch + 1) % 50 == 0 or epoch == 0 or (epoch + 1) == num_epochs:
@@ -315,19 +298,18 @@ def train_model(
     logs["total_training_time"] = total_time
 
     # save logs json
-    log_file = logs_dir / f"{dataset_name}_{model_name}_{model_id}_{timestamp}.json"
-    log_file.write_text(json.dumps(logs, indent=2))
-    logger.info("Saved logs for model %d to %s", model_id, log_file)
+    save(ckpt_path, logs=logs)
 
     wandb.finish()
-    
-    return logs
-
 
 def train_both(
     dataset,
     model1: torch.nn.Module,
     model2: torch.nn.Module,
+    input_dim1: int,
+    input_dim2: int,
+    labels1: int,
+    labels2: int,
     masks: MaskType,
     classes: ClassType,
     optimizer1,
@@ -337,21 +319,22 @@ def train_both(
     model_name: str,
     ckpt1: Path,
     ckpt2: Path,
-    logs_dir: Path,
     num_epochs: int,
     hidden_dim: int,
     lr: float,
     weight_decay: float,
     wandb_project: str,
     seed: int
-) -> tuple[dict, dict]:
+):
     (train_mask1, train_mask2, val_mask1, val_mask2, test_mask1, test_mask2) = masks
     classes1, classes2 = classes
 
     logger.info("Training model 1 (classes: %s)", sorted(list(classes1)))
-    logs1 = train_model(
+    train_model(
         model_id=1,
         model=model1,
+        input_dim=input_dim1,
+        labels=labels1,
         data=dataset,
         train_mask=train_mask1,
         val_mask=val_mask1,
@@ -361,7 +344,6 @@ def train_both(
         dataset_name=dataset_name,
         model_name=model_name,
         ckpt_path=ckpt1,
-        logs_dir=logs_dir,
         num_epochs=num_epochs,
         hidden_dim=hidden_dim,
         lr=lr,
@@ -371,9 +353,11 @@ def train_both(
     )
 
     logger.info("Training model 2 (classes: %s)", sorted(list(classes2)))
-    logs2 = train_model(
+    train_model(
         model_id=2,
         model=model2,
+        input_dim=input_dim2,
+        labels=labels2,
         data=dataset,
         train_mask=train_mask2,
         val_mask=val_mask2,
@@ -383,7 +367,6 @@ def train_both(
         dataset_name=dataset_name,
         model_name=model_name,
         ckpt_path=ckpt2,
-        logs_dir=logs_dir,
         num_epochs=num_epochs,
         hidden_dim=hidden_dim,
         lr=lr,
@@ -391,13 +374,6 @@ def train_both(
         wandb_project=wandb_project,
         seed=seed
     )
-
-    # summary
-    logger.info("Model 1 best val_acc=%.4f (epoch=%s), test@best=%.4f", logs1["best_val_acc"], logs1["best_epoch"], logs1["best_test_acc"])
-    logger.info("Model 2 best val_acc=%.4f (epoch=%s), test@best=%.4f", logs2["best_val_acc"], logs2["best_epoch"], logs2["best_test_acc"])
-
-    return logs1, logs2
-
 
 def print_split_summary(dataset, masks, classes):
     (train_mask1, train_mask2, val_mask1, val_mask2, test_mask1, test_mask2) = masks
@@ -436,7 +412,6 @@ if __name__ == "__main__":
     p.add_argument("--data-path", required=True, type=Path, help="Path to dataset file (torch .pt)")
     p.add_argument("--model1-save", required=True, type=Path, help="Checkpoint path for model 1")
     p.add_argument("--model2-save", required=True, type=Path, help="Checkpoint path for model 2")
-    p.add_argument("--logs-dir", required=True, type=Path, help="Directory to save training logs")
     p.add_argument("--num-epochs", type=int, default=NUM_EPOCHS, help="Number of training epochs")
     p.add_argument("--lr", type=int, default=LR, help="Learning rate for model")
     p.add_argument("--weight-decay", type=int, default=WEIGHT_DECAY, help="Weight decay of model")
@@ -451,8 +426,15 @@ if __name__ == "__main__":
     logger.info("Using device: %s", device)
 
     dataset, N, labels, input_dim = load_dataset(args.data_path)
-    model1, model2, opt1, opt2, criterion = build_models(args.model, input_dim, labels, device, args.hidden_dim, args.lr, args.weight_decay)
 
+    label_split = (labels + 1) // 2, labels // 2
+    model_1 = utils.build_model(args.model, input_dim, label_split[0], device, args.hidden_dim)
+    model_2 = utils.build_model(args.model, input_dim, label_split[1], device, args.hidden_dim)
+
+    opt_1 = torch.optim.Adam(model_1.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt_2 = torch.optim.Adam(model_2.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    criterion = nn.CrossEntropyLoss()
+    
     masks, classes = make_label_masks(dataset, N, labels)
 
     # Move dataset and masks to chosen device for training/inference
@@ -463,26 +445,29 @@ if __name__ == "__main__":
     print_split_summary(dataset, masks, classes)
 
     # Train both models
-    logs1, logs2 = train_both(
+    train_both(
         dataset=dataset,
-        model1=model1,
-        model2=model2,
+        model1=model_1,
+        model2=model_2,
+        input_dim1=input_dim,
+        input_dim2=input_dim,
+        labels1=label_split[0],
+        labels2=label_split[1],
         masks=masks,
         classes=classes,
-        optimizer1=opt1,
-        optimizer2=opt2,
+        optimizer1=opt_1,
+        optimizer2=opt_2,
         criterion=criterion,
         dataset_name=args.dataset,
         model_name=args.model,
         ckpt1=args.model1_save,
         ckpt2=args.model2_save,
-        logs_dir=args.logs_dir,
         num_epochs=args.num_epochs,
         hidden_dim=args.hidden_dim,
         lr=args.lr,
         weight_decay=args.weight_decay,
         wandb_project=args.wandb_project,
-        seed=args.seed
+        seed=args.seed,
     )
 
-    logger.info("All training complete. Logs saved to %s", args.logs_dir)
+    logger.info("training complete")
