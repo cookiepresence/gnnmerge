@@ -54,10 +54,7 @@ def build_model(
     return model
 
 
-def load_models(path: Path, task: Task, device: torch.device) -> tuple[torch.nn.Module, dict]:
-    with open(path / "metadata.json", "r") as f:
-        metadata = json.load(f)
-
+def load_model_raw(weight: Path, metadata: dict, device: torch.device):
     model = build_model(
         model_name=metadata["model_type"],
         input_dim=metadata["input_dim"],
@@ -66,8 +63,17 @@ def load_models(path: Path, task: Task, device: torch.device) -> tuple[torch.nn.
         device=device,
     )
 
-    state_dict = torch.load(path / "model.pt", map_location=device)
+    state_dict = torch.load(weight, map_location=device)
     model.load_state_dict(state_dict)
+
+    return model
+
+
+def load_models(path: Path, task: Task, device: torch.device) -> tuple[torch.nn.Module, dict]:
+    with open(path / "metadata.json", "r") as f:
+        metadata = json.load(f)
+
+    model = load_model_raw(path / "model.pt", metadata, device)
 
     return model, metadata
 
@@ -77,7 +83,7 @@ def load_dataset(path: Path):
     Load dataset with torch.load (map to CPU) and return dataset and metadata.
     Note: dataset is returned on CPU. Caller may move it to `device`.
     """
-    ds = torch.load(str(path), map_location="cpu")
+    ds = torch.load(str(path), map_location="cpu", weights_only=False)
     num_nodes = int(ds.num_nodes)
     num_labels = int(len(ds.label_names))
     input_dim = int(ds.x.size(1))
@@ -105,7 +111,7 @@ def make_label_masks(
         num_labels: Total number of unique labels
         num_classes: Number of class groups to split labels into (default: 2)
     """
-    device = torch.device("cpu")
+    device = get_device()
 
     # Get indices for each split
     train_indices = dataset.train_masks[0]

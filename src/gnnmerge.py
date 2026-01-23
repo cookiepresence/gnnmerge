@@ -27,9 +27,6 @@ datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("gnn-merge")
 
-MaskType = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-ClassType = tuple[set[int], set[int]]
-
 
 def save(
         path: Path,
@@ -51,20 +48,6 @@ def save(
         log_file = path / "logs.json"
         log_file.write_text(json.dumps(logs, indent=2))
 
-
-# TODO: move to utils!!!
-def load_dataset(path: Path):
-    """
-    Load dataset with torch.load (map to CPU) and return dataset and metadata.
-    Note: dataset is returned on CPU. Caller may move it to `device`.
-    """
-    ds = torch.load(str(path), map_location=utils.get_device(), weights_only=False)
-    num_nodes = int(ds.num_nodes)
-    num_labels = int(len(ds.label_names))
-    input_dim = int(ds.x.size(1))
-    logger.info("Loaded dataset from %s", path)
-    logger.info("Nodes=%d; Labels=%d; InputDim=%d", num_nodes, num_labels, input_dim)
-    return ds, num_nodes, num_labels, input_dim
 
 def hook_fn(module, input, output, ins, outs, layer_name):
     outs[layer_name] = output
@@ -131,7 +114,7 @@ def train(
         merged_model: torch.nn.Module,
         model_outputs: list[dict],
         model_inputs: list[dict],
-        masks: MaskType,
+        masks: list[utils.MaskType],
         optimizer,
         criterion
 ):
@@ -152,7 +135,8 @@ def train(
         merged_model_outputs = [merged_model_layer(*inp) for inp in model_input]
         loss = torch.sum(
             torch.stack([
-                criterion(merged, orig) for merged, orig in zip(model_output, merged_model_outputs)
+                criterion(merged[mask[0]], orig[mask[0]])
+                for merged, orig, mask in zip(model_output, merged_model_outputs, masks)
             ])
         )
         losses.append(loss)
@@ -178,27 +162,17 @@ def evaluate(
 
     # predictions shape: [2, xxx]
     # labels shape: [2, xxx]
-    # masks shape: [6, xxx]
+    # masks shape: [num_models, 3, xxx]
     
     # stack the masks so that we can index them comfortably
-    masks = torch.stack(masks).to(utils.get_device())
-    masks = masks.view(3, len(models), -1)
-
-    # Compute correct predictions: [num_models, num_samples]
-    correct = (predictions == labels).float()
+    masks = torch.cat([torch.stack(m).unsqueeze(1) for m in masks], dim=1).to(utils.get_device())
+    # sks = masks.view(3, len(models), -1) # [3, num_models, xxx]
+    correct = (predictions == labels).float().unsqueeze(0)     # [1, num_models, num_samples]
     
-    # Expand dimensions for broadcasting: [1, num_models, num_samples]
-    correct = correct.unsqueeze(0)
-    
-    # Apply masks and compute accuracies: [3, num_models]
-    # Sum correct predictions in each mask, divide by mask size
     masked_correct = (correct * masks).sum(dim=2)  # [3, num_models]
     mask_sizes = masks.sum(dim=2)  # [3, num_models]
-    
-    # Avoid division by zero
     accuracies = masked_correct / mask_sizes.clamp(min=1)
-    
-    # Split into train, val, test: each of shape [num_models]
+
     train_accs = accuracies[0]
     val_accs = accuracies[1]
     test_accs = accuracies[2]
@@ -227,6 +201,9 @@ def merge_model(
         "lr": learning_rate,
         "epochs": num_epochs,
         "seed": seed,
+        "model_type": source_metadata[0]['model_type'],
+        "input_dim": source_metadata[0]['input_dim'],
+        "hidden_dim": source_metadata[0]['hidden_dim'],
         "source_models": source_metadata
     }
     logs = collections.defaultdict(list)
@@ -269,53 +246,6 @@ def merge_model(
     
     save(save_path, None, None, None, logs)
 
-# TODO: move to utils!!!
-def make_label_masks(dataset, num_nodes: int, num_labels: int) -> tuple[MaskType, ClassType]:
-    """
-    Create boolean masks for train/val/test for both label halves,
-    and remap labels for the second model (so they are 0..C2-1).
-    Returns tuple:
-      (train_mask1, train_mask2, val_mask1, val_mask2, test_mask1, test_mask2, classes_set1, classes_set2)
-    """
-    # class splits
-    classes1 = set(range(0, (num_labels + 1) // 2))
-    classes2 = set(range((num_labels + 1) // 2, num_labels))
-
-    device = torch.device("cpu")
-
-    mk = lambda: torch.zeros(num_nodes, dtype=torch.bool, device=device)
-    train_mask1, train_mask2 = mk(), mk()
-    val_mask1, val_mask2 = mk(), mk()
-    test_mask1, test_mask2 = mk(), mk()
-
-    train_indices = dataset.train_masks[0]
-    val_indices = dataset.val_masks[0]
-    test_indices = dataset.test_masks[0]
-
-    # set masks
-    for idx in train_indices:
-        label = int(dataset.y[idx].item())
-        (train_mask1 if label in classes1 else train_mask2)[idx] = True
-
-    for idx in val_indices:
-        label = int(dataset.y[idx].item())
-        (val_mask1 if label in classes1 else val_mask2)[idx] = True
-
-    for idx in test_indices:
-        label = int(dataset.y[idx].item())
-        (test_mask1 if label in classes1 else test_mask2)[idx] = True
-
-    # remap labels for model 2 to range 0..C2-1
-    label_mapping = {old: new for new, old in enumerate(sorted(list(classes2)))}
-    y_copy = dataset.y.clone()
-    for i in range(len(y_copy)):
-        if test_mask2[i] or train_mask2[i] or val_mask2[i]:
-            y_copy[i] = label_mapping[int(y_copy[i].item())]
-    dataset.y = y_copy
-
-    return (train_mask1, train_mask2, val_mask1, val_mask2, test_mask1, test_mask2), (classes1, classes2)
-
-
 def build_merged_model(models, datasets) -> torch.nn.Module:
     model_type: list[str] = [metadata['model_type'] for _, metadata in models]
     hidden_dims: list[int] = [metadata['hidden_dim'] for _, metadata in models]
@@ -330,7 +260,7 @@ def build_merged_model(models, datasets) -> torch.nn.Module:
     return utils.build_model(
         model_name=model_type[0],
         input_dim=input_dim,
-        # since we don't care about the backbone
+        # since we only care about the backbone
         num_labels=None,
         device=utils.get_device(),
         hidden_dim=hidden_dim
@@ -356,29 +286,41 @@ if __name__ == '__main__':
     # currently, we only care about in-domain merging
     # not sure how tasks training on diff datasets have the same input dim
     models = [utils.load_models(path, task=utils.Task.NodeClassification, device=device) for path in args.model_path]
+    source_model_metadata = [metadata for _, metadata in models]
+    
+    # Load datasets from metadata (following merge script pattern)
+    dataset_names: list[str] = [metadata['dataset'] for metadata in source_model_metadata]
+    # Load all unique datasets
+    datasets: dict[str, Any] = {
+        ds: utils.load_dataset(Path('artifacts/datasets') / (ds + ".pt"))
+        for ds in set(dataset_names)
+    }
+    dataset_objs = {ds: datasets[ds][0].to(device) for ds in set(dataset_names)}
 
-    # load dataset
-    dataset_names: set[str] = set([metadata['dataset'] for model, metadata in models])
-    # TODO: remove when we add cross-domain/diff tasks
-    assert len(dataset_names) == 1
-    datasets: dict[str, Any] = {ds: load_dataset(Path('artifacts/datasets') / (ds + ".pt")) for ds in dataset_names}
+    # create masks for all datasets
+    all_masks = {}
+    model_masks = []
+    for metadata in source_model_metadata:
+        dataset_name = metadata['dataset']
+        # no point in doing repeated computations
+        if dataset_name not in all_masks:
+            masks = utils.make_label_masks(*(datasets[dataset_name][:-1]), num_classes=metadata['num_classes'])
+            all_masks[dataset_name] = masks
+
+        # pick mask based on class chosen
+        model_masks.append(all_masks[dataset_name][metadata['chosen_class']])
+
+    # Move masks to device
+    model_masks = [tuple(m.to(device) for m in mask) for mask in masks]
 
     merged_model = build_merged_model(models, datasets)
 
-    # todo: fix while using more masks
-    masks, _ = make_label_masks(*(datasets[
-        list(dataset_names)[0]
-    ][:-1]))
-
-    # todo: make this slightly cleaner
-    datasets = {ds: datasets[ds][0] for ds in datasets}
-    
     merge_model(
         merged_model,
         args.save_path,
         models,
-        datasets,
-        masks,
+        dataset_objs,
+        model_masks,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         seed=args.seed

@@ -127,6 +127,7 @@ def train_model(
     ckpt_path: Path,
     seed: int,
     wandb_project: str,
+    wandb_name: str
 ):
     """
     Train one model and save the best checkpoint based on validation accuracy.
@@ -139,6 +140,7 @@ def train_model(
         # model related
         "model_type": model_type,
         "hidden_dim": hidden_dim,
+        "task": utils.Task.NodeClassification, # since the task is node classification
         # dataset related
         "dataset": dataset_name,
         "train_nodes": train_mask.sum().item(),
@@ -157,7 +159,7 @@ def train_model(
 
     _ = wandb.init(
             project=wandb_project,
-            name=f"{dataset_name}_{model_type}_model{chosen_class}/{num_classes}",
+            name=wandb_name,
             config=config
         )
 
@@ -272,6 +274,7 @@ if __name__ == "__main__":
     p.add_argument("--weight-decay", type=int, default=WEIGHT_DECAY, help="Weight decay of model")
     p.add_argument("--hidden-dim", type=int, default=HIDDEN_DIM, help="Number of hidden dims")
     p.add_argument("--wandb-project", type=str, default="gnnmerge-repro", help="Name given to wandb project")
+    p.add_argument("--wandb-name", required=True, type=str, help="Name given to wandb run")
     p.add_argument("--seed", type=int, default=SEED, help="seed used for reproduction")
     args = p.parse_args()
 
@@ -281,6 +284,7 @@ if __name__ == "__main__":
     logger.info("Using device: %s", device)
 
     dataset, num_nodes, num_labels, input_dim = utils.load_dataset(args.data_path)
+    dataset = dataset.to(utils.get_device())
     masks = utils.make_label_masks(dataset, num_nodes, num_labels, num_classes=args.num_classes)
     train_mask, val_mask, test_mask = masks[args.chosen_class]
     dataset = dataset.to(device)
@@ -317,6 +321,7 @@ if __name__ == "__main__":
         seed=args.seed,
         wandb_project=args.wandb_project,
         ckpt_path=args.save_path,
+        wandb_name=args.wandb_name
     )
 
     logger.info("training complete")
