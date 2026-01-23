@@ -22,10 +22,29 @@ DEFAULT_WD = 0.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
-
-datefmt="%Y-%m-%d %H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("gnn-merge")
+
+
+def pad_dataset(data, target_dim: int):
+    """
+    Pad dataset features to target dimension by adding zeros.
+
+    Args:
+        data: PyTorch Geometric Data object
+        target_dim: Target feature dimension
+
+    Returns:
+        Modified data object with padded features
+    """
+    current_dim = data.x.shape[1]
+    if current_dim < target_dim:
+        padding = torch.zeros(data.x.shape[0], target_dim - current_dim,
+                             dtype=data.x.dtype, device=data.x.device)
+        data.x = torch.cat([data.x, padding], dim=1)
+        logger.info(f"Padded dataset features from {current_dim} to {target_dim}")
+    return data
 
 
 def save(
@@ -130,7 +149,7 @@ def train(
 
         # print(model_output)
         # print(model_input)
-        
+
         merged_model_layer = getattr(merged_model, layer)
         merged_model_outputs = [merged_model_layer(*inp) for inp in model_input]
         loss = torch.sum(
@@ -163,12 +182,12 @@ def evaluate(
     # predictions shape: [2, xxx]
     # labels shape: [2, xxx]
     # masks shape: [num_models, 3, xxx]
-    
+
     # stack the masks so that we can index them comfortably
     masks = torch.cat([torch.stack(m).unsqueeze(1) for m in masks], dim=1).to(utils.get_device())
     # sks = masks.view(3, len(models), -1) # [3, num_models, xxx]
     correct = (predictions == labels).float().unsqueeze(0)     # [1, num_models, num_samples]
-    
+
     masked_correct = (correct * masks).sum(dim=2)  # [3, num_models]
     mask_sizes = masks.sum(dim=2)  # [3, num_models]
     accuracies = masked_correct / mask_sizes.clamp(min=1)
@@ -176,7 +195,7 @@ def evaluate(
     train_accs = accuracies[0]
     val_accs = accuracies[1]
     test_accs = accuracies[2]
-    
+
     return train_accs, val_accs, test_accs
 
 def merge_model(
@@ -209,12 +228,12 @@ def merge_model(
     logs = collections.defaultdict(list)
     save(save_path, None, models, metadata, None)
     best_val_accs = torch.tensor([0. for _ in models], device=utils.get_device())
-    
+
     logger.info("starting model merging...")
     for epoch in range(num_epochs):
         train_losses = train(merged_model, model_outputs, model_inputs, masks, optimizer, criterion)
         train_accs, val_accs, test_accs = evaluate(merged_model, models, source_metadata, datasets, masks)
-        
+
         # Log to collections - convert tensors to Python lists/scalars
         for i, loss in enumerate(train_losses):
             logs[f"train_loss_{i}"].append(loss.item())
@@ -224,16 +243,16 @@ def merge_model(
             logs[f"val_acc_{i}"].append(val_acc.item())
         for i, test_acc in enumerate(test_accs):
             logs[f"test_acc_{i}"].append(test_acc.item())
-        
+
         # Check if current validation accuracies are better (all should be better)
         if torch.all(val_accs > best_val_accs):
             best_val_accs = val_accs.clone()
             save(save_path, merged_model, None, None, logs)
-            logger.info("Saved best checkpoint for the merged model to %s (val_acc=%s, test_acc=%s)", 
-                       save_path, 
-                       val_accs.tolist(), 
+            logger.info("Saved best checkpoint for the merged model to %s (val_acc=%s, test_acc=%s)",
+                       save_path,
+                       val_accs.tolist(),
                        test_accs.tolist())
-        
+
         if (epoch + 1) % 50 == 0 or epoch == 0 or (epoch + 1) == num_epochs:
             logger.info(
                 "Epoch %d/%d | TrainAcc=%s ValAcc=%s TestAcc=%s | TrainLoss=%s",
@@ -243,23 +262,21 @@ def merge_model(
                 test_accs.tolist(),
                 [loss.item() for loss in train_losses]
             )
-    
+
     save(save_path, None, None, None, logs)
 
-def build_merged_model(models, datasets) -> torch.nn.Module:
+def build_merged_model(models, datasets, max_input_dim: int) -> torch.nn.Module:
     model_type: list[str] = [metadata['model_type'] for _, metadata in models]
     hidden_dims: list[int] = [metadata['hidden_dim'] for _, metadata in models]
     # all models are the same type
     assert all([m == model_type[0] for m in model_type])
-    # all models have the same input dim
+    # all models have the same hidden dim
     assert all([dim == hidden_dims[0] for dim in hidden_dims])
 
-    # stored as a tuple, hence we get it this way
-    input_dim = datasets[list(datasets.keys())[0]][-1]
     hidden_dim = hidden_dims[0]
     return utils.build_model(
         model_name=model_type[0],
-        input_dim=input_dim,
+        input_dim=max_input_dim,
         # since we only care about the backbone
         num_labels=None,
         device=utils.get_device(),
@@ -282,12 +299,12 @@ if __name__ == '__main__':
     utils.__init__randomness__(args.seed)
 
     device = utils.get_device()
-    
+
     # currently, we only care about in-domain merging
     # not sure how tasks training on diff datasets have the same input dim
     models = [utils.load_models(path, task=utils.Task.NodeClassification, device=device) for path in args.model_path]
     source_model_metadata = [metadata for _, metadata in models]
-    
+
     # Load datasets from metadata (following merge script pattern)
     dataset_names: list[str] = [metadata['dataset'] for metadata in source_model_metadata]
     # Load all unique datasets
@@ -295,7 +312,21 @@ if __name__ == '__main__':
         ds: utils.load_dataset(Path('artifacts/datasets') / (ds + ".pt"))
         for ds in set(dataset_names)
     }
-    dataset_objs = {ds: datasets[ds][0].to(device) for ds in set(dataset_names)}
+
+    # Determine maximum input dimension across all datasets
+    max_input_dim = max(datasets[ds][-1] for ds in set(dataset_names))
+    logger.info(f"Maximum input dimension across datasets: {max_input_dim}")
+
+    # Pad all datasets to max_input_dim and move to device
+    dataset_objs = {}
+    for ds in set(dataset_names):
+        data = datasets[ds][0].to(device)
+        data = pad_dataset(data, max_input_dim)
+        dataset_objs[ds] = data
+
+    # Update datasets dict to include padded dimension
+    for ds in set(dataset_names):
+        datasets[ds] = (*datasets[ds][:-1], max_input_dim)
 
     # create masks for all datasets
     all_masks = {}
@@ -311,9 +342,9 @@ if __name__ == '__main__':
         model_masks.append(all_masks[dataset_name][metadata['chosen_class']])
 
     # Move masks to device
-    model_masks = [tuple(m.to(device) for m in mask) for mask in masks]
+    model_masks = [tuple(m.to(device) for m in mask) for mask in model_masks]
 
-    merged_model = build_merged_model(models, datasets)
+    merged_model = build_merged_model(models, datasets, max_input_dim)
 
     merge_model(
         merged_model,
