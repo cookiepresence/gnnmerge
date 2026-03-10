@@ -8,6 +8,7 @@ from typing import Iterable, Any, Optional
 
 import torch
 import torch_geometric
+import wandb
 
 import utils
 
@@ -27,17 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger("gnn-merge")
 
 
-def pad_dataset(data, target_dim: int):
-    """
-    Pad dataset features to target dimension by adding zeros.
-
-    Args:
-        data: PyTorch Geometric Data object
-        target_dim: Target feature dimension
-
-    Returns:
-        Modified data object with padded features
-    """
+def pad_dataset_features(data, target_dim: int):
     current_dim = data.x.shape[1]
     if current_dim < target_dim:
         padding = torch.zeros(data.x.shape[0], target_dim - current_dim,
@@ -45,6 +36,51 @@ def pad_dataset(data, target_dim: int):
         data.x = torch.cat([data.x, padding], dim=1)
         logger.info(f"Padded dataset features from {current_dim} to {target_dim}")
     return data
+
+
+def pad_model_first_layer(model, current_dim: int, target_dim: int, backbone_attr: str = "backbone"):
+    if current_dim >= target_dim:
+        return model
+
+    backbone = getattr(model, backbone_attr)
+
+    first_layer_name = None
+    first_layer = None
+    for name, module in backbone.named_children():
+        first_layer_name = name
+        first_layer = module
+        break
+
+    if first_layer is None:
+        raise ValueError("Could not find first layer in backbone")
+
+    padding_size = target_dim - current_dim
+
+    if hasattr(first_layer, 'lin'):
+        old_weight = first_layer.lin.weight.data
+        weight_padding = torch.zeros(old_weight.shape[0], padding_size,
+                                     dtype=old_weight.dtype, device=old_weight.device)
+        first_layer.lin.weight.data = torch.cat([old_weight, weight_padding], dim=1)
+        if hasattr(first_layer, 'in_channels'):
+            first_layer.in_channels = target_dim
+        logger.info(f"Padded model '{first_layer_name}' layer from {current_dim} to {target_dim}")
+
+    elif isinstance(first_layer, torch.nn.Linear):
+        old_weight = first_layer.weight.data
+        weight_padding = torch.zeros(old_weight.shape[0], padding_size,
+                                     dtype=old_weight.dtype, device=old_weight.device)
+        first_layer.weight.data = torch.cat([old_weight, weight_padding], dim=1)
+        first_layer.in_features = target_dim
+        logger.info(f"Padded model Linear layer from {current_dim} to {target_dim}")
+    else:
+        logger.warning(f"Unknown first layer type: {type(first_layer)}. Attempting to pad 'weight' attribute.")
+        if hasattr(first_layer, 'weight'):
+            old_weight = first_layer.weight.data
+            weight_padding = torch.zeros(old_weight.shape[0], padding_size,
+                                        dtype=old_weight.dtype, device=old_weight.device)
+            first_layer.weight.data = torch.cat([old_weight, weight_padding], dim=1)
+
+    return model
 
 
 def save(
@@ -69,35 +105,14 @@ def save(
 
 
 def hook_fn(module, input, output, ins, outs, layer_name):
-    outs[layer_name] = output
-    ins[layer_name] = input
+    outs[layer_name] = output.detach().clone()
+    ins[layer_name] = tuple(inp.detach().clone() for inp in input)
 
 def register_hooks(
     models: Iterable,
     hook_fn,
     backbone_attr: str = "backbone",
 ) -> tuple[list[list], list[dict], list[dict]]:
-    """
-    Register forward hooks on every layer in each model's backbone.
-
-    Args:
-        models: iterable of model objects (e.g. [model1, model2, ...]).
-        hook_fn: callable used as the hook; will be partially applied with outs, ins, layer_name.
-                 Signature after partial must match PyTorch forward hook: (module, input, output).
-        backbone_attr: attribute name pointing to the backbone module (default "backbone").
-        include_containers: if False (default), register only on leaf modules (modules with no child modules).
-                            if True, register on every module returned by named_modules().
-        include_root: whether to include the root backbone module itself (named_modules yields root with name '').
-
-    Returns:
-        (hooks, outs, ins)
-        - hooks: list (per model) of lists of hook handles.
-        - outs:  list (per model) of lists where hook_fn can append outputs.
-        - ins:   list (per model) of lists where hook_fn can append inputs.
-    Notes:
-        - No try/except; missing backbone_attr or other attribute lookups will raise.
-        - The layer_name passed to hook_fn will be prefixed with "m{index}:" to keep names unique across models.
-    """
     models = list(models)
 
     all_hooks: list[list] = []
@@ -112,8 +127,6 @@ def register_hooks(
         model_ins: dict = {}
 
         for name, module in parent.named_modules():
-            # skip if it is the root module or a nested child module
-            # we only want immiediate children!!
             if name == '' or '.' in name:
                 continue
             layer_name = f"{name}"
@@ -128,6 +141,71 @@ def register_hooks(
 
     return all_hooks, all_outs, all_ins
 
+def info_nce_loss(
+    merged_model_outputs,
+    model_output,
+    masks,
+    temperature: float = 0.07,
+    normalize: bool = True,
+):
+    losses = []
+    for merged, orig, mask in zip(merged_model_outputs, model_output, masks):
+        sel = mask[0]
+        z1 = merged[sel]
+        z2 = orig[sel]
+
+        n = z1.shape[0]
+        if normalize:
+            z1 = torch.nn.functional.normalize(z1, dim=1)
+            z2 = torch.nn.functional.normalize(z2, dim=1)
+
+        sim = torch.matmul(z1, z2.T) / temperature
+        positives = torch.arange(0, n, device=sim.device)
+        loss = torch.nn.functional.cross_entropy(sim, positives) + torch.nn.functional.cross_entropy(sim.T, positives)
+        losses.append(loss / 2)
+
+    return torch.mean(torch.sum(torch.stack(losses), dim=0))
+
+def subsample_train_mask_by_class(
+        labels: torch.Tensor,
+        train_mask: torch.Tensor,
+        ratio: float,
+        generator: torch.Generator,
+):
+    if ratio >= 1.0:
+        return train_mask
+
+    new_mask = torch.zeros_like(train_mask, dtype=torch.bool)
+    classes = labels.unique()
+
+    for c in classes:
+        idx = (labels == c) & train_mask
+        idx = idx.nonzero(as_tuple=False).view(-1)
+        if idx.numel() == 0:
+            continue
+        k = max(1, int(idx.numel() * ratio))
+        perm = idx[torch.randperm(idx.numel(), generator=generator, device=generator.device)]
+        chosen = perm[:k]
+        new_mask[chosen] = True
+    return new_mask
+
+def compute_grad_norms(model: torch.nn.Module) -> dict[str, float]:
+    """
+    Compute per-parameter and total L2 gradient norms for a model.
+    Call after .backward() and before .zero_grad().
+
+    Returns a dict with keys "<param_name>" for each parameter that has a
+    gradient, plus "total" for the global L2 norm across all parameters.
+    """
+    norms: dict[str, float] = {}
+    total_sq = 0.0
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            pnorm = param.grad.detach().norm(2).item()
+            norms[name] = pnorm
+            total_sq += pnorm ** 2
+    norms["total"] = total_sq ** 0.5
+    return norms
 
 def train(
         merged_model: torch.nn.Module,
@@ -135,34 +213,37 @@ def train(
         model_inputs: list[dict],
         masks: list[utils.MaskType],
         optimizer,
-        criterion
+        criterion,
+        mse_loss_fn=None,
+        contrastive_loss_fn=None,
 ):
     merged_model.train()
     optimizer.zero_grad()
-
     losses = []
+    mse_losses = []
+    contrastive_losses = []
 
-    # assumption: all models have the same keys
     for layer in model_outputs[0].keys():
         model_output = [outputs[layer] for outputs in model_outputs]
-        model_input = [inputs[layer] for inputs in model_inputs]
+        model_input  = [inputs[layer]  for inputs  in model_inputs]
 
-        # print(model_output)
-        # print(model_input)
-
-        merged_model_layer = getattr(merged_model, layer)
+        merged_model_layer   = getattr(merged_model, layer)
         merged_model_outputs = [merged_model_layer(*inp) for inp in model_input]
-        loss = torch.sum(
-            torch.stack([
-                criterion(merged[mask[0]], orig[mask[0]])
-                for merged, orig, mask in zip(model_output, merged_model_outputs, masks)
-            ])
-        )
+
+        loss = criterion(merged_model_outputs, model_output, masks)
         losses.append(loss)
 
-    torch.stack(losses).sum().backward(retain_graph=True)
+        if mse_loss_fn is not None:
+            with torch.no_grad():
+                mse_losses.append(mse_loss_fn(merged_model_outputs, model_output, masks).item())
+        if contrastive_loss_fn is not None:
+            with torch.no_grad():
+                contrastive_losses.append(contrastive_loss_fn(merged_model_outputs, model_output, masks).item())
+
+    torch.stack(losses).sum().backward()
+    grad_norms = compute_grad_norms(merged_model)
     optimizer.step()
-    return losses
+    return losses, grad_norms, mse_losses, contrastive_losses
 
 def evaluate(
         merged_model,
@@ -173,28 +254,29 @@ def evaluate(
 ):
     merged_model.eval()
 
-    merged_output = [merged_model(datasets[meta['dataset']]) for meta in metadata]
+    train_accs = []
+    val_accs = []
+    test_accs = []
 
-    predictions = [model.mlp(out).argmax(dim=1) for model, out in zip(models, merged_output)]
-    predictions = torch.stack(predictions)
-    labels = torch.stack([datasets[meta['dataset']].y for meta in metadata])
+    for i, (model, meta, mask) in enumerate(zip(models, metadata, masks)):
+        merged_output = merged_model(datasets[meta['dataset']])
+        predictions = model.mlp(merged_output).argmax(dim=1)
+        labels = datasets[meta['dataset']].y
+        correct = (predictions == labels).float()
 
-    # predictions shape: [2, xxx]
-    # labels shape: [2, xxx]
-    # masks shape: [num_models, 3, xxx]
+        train_mask, val_mask, test_mask = mask
 
-    # stack the masks so that we can index them comfortably
-    masks = torch.cat([torch.stack(m).unsqueeze(1) for m in masks], dim=1).to(utils.get_device())
-    # sks = masks.view(3, len(models), -1) # [3, num_models, xxx]
-    correct = (predictions == labels).float().unsqueeze(0)     # [1, num_models, num_samples]
+        train_acc = correct[train_mask].sum() / train_mask.sum().clamp(min=1)
+        val_acc = correct[val_mask].sum() / val_mask.sum().clamp(min=1)
+        test_acc = correct[test_mask].sum() / test_mask.sum().clamp(min=1)
 
-    masked_correct = (correct * masks).sum(dim=2)  # [3, num_models]
-    mask_sizes = masks.sum(dim=2)  # [3, num_models]
-    accuracies = masked_correct / mask_sizes.clamp(min=1)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
+        test_accs.append(test_acc)
 
-    train_accs = accuracies[0]
-    val_accs = accuracies[1]
-    test_accs = accuracies[2]
+    train_accs = torch.tensor(train_accs, device=utils.get_device())
+    val_accs = torch.tensor(val_accs, device=utils.get_device())
+    test_accs = torch.tensor(test_accs, device=utils.get_device())
 
     return train_accs, val_accs, test_accs
 
@@ -204,17 +286,40 @@ def merge_model(
         models: list[tuple[torch.nn.Module, dict]],
         datasets,
         masks,
+        subsample_ratio: float,
+        mse_loss_weight: float,
+        contrastive_loss_weight: float,
         learning_rate: float,
         weight_decay: float,
         seed: int,
-        num_epochs: int = 1000
+        num_epochs: int = 1000,
+        wandb_project: Optional[str] = None,
+        wandb_run_name: Optional[str] = None,
 ):
     source_metadata: list[dict] = [metadata for _, metadata in models]
     models: list[torch.nn.Module] = [model.eval() for model, _ in models]
     model_hooks, model_outputs, model_inputs = register_hooks(models, hook_fn)
     _ = [model.backbone(datasets[metadata['dataset']]) for model, metadata in zip(models, source_metadata)]
     optimizer = torch.optim.Adam(merged_model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    criterion = torch.nn.MSELoss(reduction='mean')
+
+    mse_loss = lambda merged_model_outputs, model_output, masks: torch.sum(
+        torch.stack([
+            torch.nn.MSELoss(reduction='mean')(merged[mask[0]], orig[mask[0]])
+            for merged, orig, mask in zip(merged_model_outputs, model_output, masks)
+        ])
+    )
+
+    match (mse_loss_weight, contrastive_loss_weight):
+        case (0, w):
+            criterion = info_nce_loss
+        case (w, 0):
+            criterion = mse_loss
+        case (w_mse, w_cl):
+            criterion = lambda merged_model_outputs, model_output, masks: (
+                w_mse * mse_loss(merged_model_outputs, model_output, masks)
+                + w_cl * info_nce_loss(merged_model_outputs, model_output, masks)
+            )
+
     metadata = {
         "weight_decay": weight_decay,
         "lr": learning_rate,
@@ -223,35 +328,115 @@ def merge_model(
         "model_type": source_metadata[0]['model_type'],
         "input_dim": source_metadata[0]['input_dim'],
         "hidden_dim": source_metadata[0]['hidden_dim'],
+        "mse_loss_weight": mse_loss_weight,
+        "contrastive_loss_weight": contrastive_loss_weight,
+        "subsample_ratio": subsample_ratio,
         "source_models": source_metadata
     }
+
     logs = collections.defaultdict(list)
     save(save_path, None, models, metadata, None)
     best_val_accs = torch.tensor([0. for _ in models], device=utils.get_device())
 
+    labels = [datasets[meta['dataset']].y for meta in source_metadata]
+
+    gen = torch.Generator(device=utils.get_device())
+    gen.manual_seed(DEFAULT_SEED)
+
+    subsampled_masks = []
+    for (train_mask, val_mask, test_mask), y in zip(masks, labels):
+        sub_train = subsample_train_mask_by_class(y, train_mask, subsample_ratio, gen)
+        subsampled_masks.append((sub_train, val_mask, test_mask))
+
+    # ------------------------------------------------------------------
+    # wandb: build a stable per-model metric prefix from dataset metadata
+    # e.g.  "cora/2/7"  →  dataset=cora, chosen_class=2, num_classes=7
+    # ------------------------------------------------------------------
+    use_wandb = wandb_project is not None
+    if use_wandb:
+        wandb.init(
+            project=wandb_project,
+            name=wandb_run_name,
+            config=metadata,
+        )
+        # Pre-compute prefix strings so we don't recompute every epoch
+        # layers (keys) are only known after the first forward pass, handled inside the loop
+        model_prefixes = [
+            f"{meta['dataset']}/{meta['chosen_class']}/{meta['num_classes']}"
+            for meta in source_metadata
+        ]
+        layer_names = list(model_outputs[0].keys())   # stable after first forward pass
+        logger.info("wandb run initialised — prefixes: %s", model_prefixes)
+
     logger.info("starting model merging...")
     for epoch in range(num_epochs):
-        train_losses = train(merged_model, model_outputs, model_inputs, masks, optimizer, criterion)
+        train_losses, grad_norms, mse_losses, contrastive_losses = train(
+            merged_model, model_outputs, model_inputs, subsampled_masks, optimizer, criterion,
+            contrastive_loss_fn=info_nce_loss if contrastive_loss_weight > 0 else None,
+            mse_loss_fn=mse_loss if mse_loss_weight > 0 else None)
         train_accs, val_accs, test_accs = evaluate(merged_model, models, source_metadata, datasets, masks)
 
-        # Log to collections - convert tensors to Python lists/scalars
+        # ---- internal logs (unchanged) ----
         for i, loss in enumerate(train_losses):
             logs[f"train_loss_{i}"].append(loss.item())
+        if mse_loss_weight > 0:
+            for i, loss in enumerate(mse_losses):
+                logs[f"train_mse_loss_{i}"].append(loss)
+        if contrastive_loss_weight > 0:
+            for i, loss in enumerate(contrastive_losses):
+                logs[f"train_contrastive_loss_{i}"].append(loss)
         for i, train_acc in enumerate(train_accs):
             logs[f"train_acc_{i}"].append(train_acc.item())
         for i, val_acc in enumerate(val_accs):
             logs[f"val_acc_{i}"].append(val_acc.item())
         for i, test_acc in enumerate(test_accs):
             logs[f"test_acc_{i}"].append(test_acc.item())
+        logs["grad_norm_total"].append(grad_norms["total"])
 
-        # Check if current validation accuracies are better (all should be better)
+        # ---- wandb logging ----
+        if use_wandb:
+            wb_log: dict[str, float] = {}
+
+            # Per-model accuracy metrics, namespaced by dataset/split/total
+            for i, prefix in enumerate(model_prefixes):
+                wb_log[f"{prefix}/train_acc"] = train_accs[i].item()
+                wb_log[f"{prefix}/val_acc"]   = val_accs[i].item()
+                wb_log[f"{prefix}/test_acc"]  = test_accs[i].item()
+
+            # Per-layer losses, also namespaced by dataset/split/total for each model
+            for layer_idx, (layer_name, loss) in enumerate(zip(layer_names, train_losses)):
+                for i, prefix in enumerate(model_prefixes):
+                    wb_log[f"{prefix}/train_loss/{layer_name}"] = loss.item()
+            if mse_loss_weight > 0:
+                for layer_idx, (layer_name, loss) in enumerate(zip(layer_names, mse_losses)):
+                    for i, prefix in enumerate(model_prefixes):
+                        wb_log[f"{prefix}/train_mse_loss/{layer_name}"] = loss.item()
+            if contrastive_loss_weight > 0:
+                for layer_idx, (layer_name, loss) in enumerate(zip(layer_names, contrastive_losses)):
+                    for i, prefix in enumerate(model_prefixes):
+                        wb_log[f"{prefix}/train_contrastive_loss/{layer_name}"] = loss.item()
+
+            # Grad norms — logged under grad_norm/<param_name> and grad_norm/total
+            # These belong to the merged model, not to any individual source model,
+            # so we use a flat namespace rather than the per-model prefix.
+            for param_name, norm_val in grad_norms.items():
+                # Replace dots in param names (e.g. "backbone.conv1.weight") with
+                # slashes so wandb groups them into a clean nested panel.
+                key = param_name.replace(".", "/")
+                wb_log[f"grad_norm/{key}"] = norm_val
+
+            wandb.log(wb_log, step=epoch)
+
+        # ---- checkpoint ----
         if torch.all(val_accs > best_val_accs):
             best_val_accs = val_accs.clone()
             save(save_path, merged_model, None, None, logs)
-            logger.info("Saved best checkpoint for the merged model to %s (val_acc=%s, test_acc=%s)",
-                       save_path,
-                       val_accs.tolist(),
-                       test_accs.tolist())
+            logger.info(
+                "Saved best checkpoint to %s (train_acc=%s, val_acc=%s, test_acc=%s)",
+                save_path, train_accs.tolist(), val_accs.tolist(), test_accs.tolist()
+            )
+            if use_wandb:
+                wandb.summary["best_val_accs"] = best_val_accs.tolist()
 
         if (epoch + 1) % 50 == 0 or epoch == 0 or (epoch + 1) == num_epochs:
             logger.info(
@@ -265,19 +450,19 @@ def merge_model(
 
     save(save_path, None, None, None, logs)
 
-def build_merged_model(models, datasets, max_input_dim: int) -> torch.nn.Module:
+    if use_wandb:
+        wandb.finish()
+
+def build_merged_model(models, max_input_dim: int) -> torch.nn.Module:
     model_type: list[str] = [metadata['model_type'] for _, metadata in models]
     hidden_dims: list[int] = [metadata['hidden_dim'] for _, metadata in models]
-    # all models are the same type
     assert all([m == model_type[0] for m in model_type])
-    # all models have the same hidden dim
     assert all([dim == hidden_dims[0] for dim in hidden_dims])
 
     hidden_dim = hidden_dims[0]
     return utils.build_model(
         model_name=model_type[0],
         input_dim=max_input_dim,
-        # since we only care about the backbone
         num_labels=None,
         device=utils.get_device(),
         hidden_dim=hidden_dim
@@ -290,6 +475,12 @@ if __name__ == '__main__':
     parser.add_argument("--lr", type=float, default=DEFAULT_LR, help="learning rate")
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WD, help="weight decay")
     parser.add_argument("--save-path", type=Path, help="where to save the merged model")
+    parser.add_argument("--mse-loss-weight", type=float, help='how much to weigh mse loss?')
+    parser.add_argument("--contrastive-loss-weight", type=float, help='how much to weigh contrastive loss?')
+    parser.add_argument("--subsample-ratio", type=float, default=1.0, help="how many of each class to (sub)sample?")
+    # wandb
+    parser.add_argument("--wandb-project", type=str, default=None, help="wandb project name (omit to disable wandb)")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="wandb run name (optional)")
     args = parser.parse_args()
 
     if args.model_path is None or args.save_path is None:
@@ -300,51 +491,48 @@ if __name__ == '__main__':
 
     device = utils.get_device()
 
-    # currently, we only care about in-domain merging
-    # not sure how tasks training on diff datasets have the same input dim
     models = [utils.load_models(path, task=utils.Task.NodeClassification, device=device) for path in args.model_path]
     source_model_metadata = [metadata for _, metadata in models]
 
-    # Load datasets from metadata (following merge script pattern)
     dataset_names: list[str] = [metadata['dataset'] for metadata in source_model_metadata]
-    # Load all unique datasets
     datasets: dict[str, Any] = {
         ds: utils.load_dataset(Path('artifacts/datasets') / (ds + ".pt"))
         for ds in set(dataset_names)
     }
 
-    # Determine maximum input dimension across all datasets
-    max_input_dim = max(datasets[ds][-1] for ds in set(dataset_names))
-    logger.info(f"Maximum input dimension across datasets: {max_input_dim}")
+    input_dims = {ds: datasets[ds][-1] for ds in set(dataset_names)}
+    max_input_dim = max(input_dims.values())
+    logger.info(f"Input dimensions: {input_dims}")
+    logger.info(f"Maximum input dimension: {max_input_dim}")
 
-    # Pad all datasets to max_input_dim and move to device
     dataset_objs = {}
     for ds in set(dataset_names):
         data = datasets[ds][0].to(device)
-        data = pad_dataset(data, max_input_dim)
+        data = pad_dataset_features(data, max_input_dim)
         dataset_objs[ds] = data
 
-    # Update datasets dict to include padded dimension
-    for ds in set(dataset_names):
-        datasets[ds] = (*datasets[ds][:-1], max_input_dim)
+    logger.info("Padding source models to accept max input dimension...")
+    padded_models = []
+    for (model, metadata) in models:
+        current_input_dim = metadata['input_dim']
+        if current_input_dim < max_input_dim:
+            model = pad_model_first_layer(model, current_input_dim, max_input_dim)
+        padded_models.append((model, metadata))
 
-    # create masks for all datasets
+    models = padded_models
+
     all_masks = {}
     model_masks = []
     for metadata in source_model_metadata:
         dataset_name = metadata['dataset']
-        # no point in doing repeated computations
         if dataset_name not in all_masks:
             masks = utils.make_label_masks(*(datasets[dataset_name][:-1]), num_classes=metadata['num_classes'])
             all_masks[dataset_name] = masks
-
-        # pick mask based on class chosen
         model_masks.append(all_masks[dataset_name][metadata['chosen_class']])
 
-    # Move masks to device
     model_masks = [tuple(m.to(device) for m in mask) for mask in model_masks]
 
-    merged_model = build_merged_model(models, datasets, max_input_dim)
+    merged_model = build_merged_model(models, max_input_dim)
 
     merge_model(
         merged_model,
@@ -352,7 +540,12 @@ if __name__ == '__main__':
         models,
         dataset_objs,
         model_masks,
+        subsample_ratio=args.subsample_ratio,
+        mse_loss_weight=args.mse_loss_weight,
+        contrastive_loss_weight=args.contrastive_loss_weight,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
-        seed=args.seed
+        seed=args.seed,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
     )
