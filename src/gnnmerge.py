@@ -141,30 +141,67 @@ def register_hooks(
 
     return all_hooks, all_outs, all_ins
 
-def info_nce_loss(
+# def info_nce_loss(
+#     merged_model_outputs,
+#     model_output,
+#     masks,
+#     temperature: float = 1.0,
+#     normalize: bool = True,
+# ):
+#     losses = []
+#     for merged, orig, mask in zip(merged_model_outputs, model_output, masks):
+#         sel = mask[0]
+#         z1 = merged[sel]
+#         z2 = orig[sel]
+
+#         n = z1.shape[0]
+#         if normalize:
+#             z1 = torch.nn.functional.normalize(z1, dim=1)
+#             z2 = torch.nn.functional.normalize(z2, dim=1)
+
+#         sim = torch.matmul(z1, z2.T) / temperature
+#         positives = torch.arange(0, n, device=sim.device)
+#         loss = torch.nn.functional.cross_entropy(sim, positives) # + torch.nn.functional.cross_entropy(sim.T, positives)
+#         losses.append(loss / 2)
+
+#     return torch.mean(torch.sum(torch.stack(losses), dim=0))
+
+def siglip_loss(
     merged_model_outputs,
     model_output,
     masks,
-    temperature: float = 0.07,
+    temperature: float = 1.0,
     normalize: bool = True,
 ):
     losses = []
+
     for merged, orig, mask in zip(merged_model_outputs, model_output, masks):
+
         sel = mask[0]
+
         z1 = merged[sel]
         z2 = orig[sel]
 
         n = z1.shape[0]
+        if n == 0:
+            continue
+
         if normalize:
             z1 = torch.nn.functional.normalize(z1, dim=1)
             z2 = torch.nn.functional.normalize(z2, dim=1)
 
-        sim = torch.matmul(z1, z2.T) / temperature
-        positives = torch.arange(0, n, device=sim.device)
-        loss = torch.nn.functional.cross_entropy(sim, positives) + torch.nn.functional.cross_entropy(sim.T, positives)
-        losses.append(loss / 2)
+        logits = torch.matmul(z1, z2.T) / temperature
 
-    return torch.mean(torch.sum(torch.stack(losses), dim=0))
+        targets = 2 * torch.eye(n, device=logits.device) - torch.ones(n, device=logits.device)
+
+        loss = (
+            torch.nn.functional.binary_cross_entropy_with_logits(logits, targets)
+            # + torch.nn.functional.binary_cross_entropy_with_logits(logits.T, targets)
+        ) # / 2
+
+        losses.append(loss)
+
+    return torch.mean(torch.stack(losses))
 
 def subsample_train_mask_by_class(
         labels: torch.Tensor,
@@ -311,13 +348,13 @@ def merge_model(
 
     match (mse_loss_weight, contrastive_loss_weight):
         case (0, w):
-            criterion = info_nce_loss
+            criterion = siglip_loss
         case (w, 0):
             criterion = mse_loss
         case (w_mse, w_cl):
             criterion = lambda merged_model_outputs, model_output, masks: (
                 w_mse * mse_loss(merged_model_outputs, model_output, masks)
-                + w_cl * info_nce_loss(merged_model_outputs, model_output, masks)
+                + w_cl * siglip_loss(merged_model_outputs, model_output, masks)
             )
 
     metadata = {
@@ -372,7 +409,7 @@ def merge_model(
     for epoch in range(num_epochs):
         train_losses, grad_norms, mse_losses, contrastive_losses = train(
             merged_model, model_outputs, model_inputs, subsampled_masks, optimizer, criterion,
-            contrastive_loss_fn=info_nce_loss if contrastive_loss_weight > 0 else None,
+            contrastive_loss_fn=siglip_loss if contrastive_loss_weight > 0 else None,
             mse_loss_fn=mse_loss if mse_loss_weight > 0 else None)
         train_accs, val_accs, test_accs = evaluate(merged_model, models, source_metadata, datasets, masks)
 
@@ -410,11 +447,11 @@ def merge_model(
             if mse_loss_weight > 0:
                 for layer_idx, (layer_name, loss) in enumerate(zip(layer_names, mse_losses)):
                     for i, prefix in enumerate(model_prefixes):
-                        wb_log[f"{prefix}/train_mse_loss/{layer_name}"] = loss.item()
+                        wb_log[f"{prefix}/train_mse_loss/{layer_name}"] = loss
             if contrastive_loss_weight > 0:
                 for layer_idx, (layer_name, loss) in enumerate(zip(layer_names, contrastive_losses)):
                     for i, prefix in enumerate(model_prefixes):
-                        wb_log[f"{prefix}/train_contrastive_loss/{layer_name}"] = loss.item()
+                        wb_log[f"{prefix}/train_contrastive_loss/{layer_name}"] = loss
 
             # Grad norms — logged under grad_norm/<param_name> and grad_norm/total
             # These belong to the merged model, not to any individual source model,
