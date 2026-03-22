@@ -15,6 +15,8 @@ import utils
 DEFAULT_SEED = 42
 DEFAULT_LR = 5e-2
 DEFAULT_WD = 0.
+DEFAULT_EPOCHS = 1000
+DEFAULT_TRAINING_MODE = "layerwise"
 
 
 # -------------------------
@@ -282,6 +284,39 @@ def train(
     optimizer.step()
     return losses, grad_norms, mse_losses, contrastive_losses
 
+def train_e2e(
+        merged_model: torch.nn.Module,
+        teacher_outputs: list[torch.Tensor],
+        datasets: dict[str, Any],
+        metadata: list[dict[str, Any]],
+        masks: list[utils.MaskType],
+        optimizer,
+        criterion,
+        mse_loss_fn=None,
+        contrastive_loss_fn=None,
+):
+    merged_model.train()
+    optimizer.zero_grad()
+
+    merged_outputs = [merged_model(datasets[meta['dataset']]) for meta in metadata]
+    loss = criterion(merged_outputs, teacher_outputs, masks)
+    loss.backward()
+
+    grad_norms = compute_grad_norms(merged_model)
+    optimizer.step()
+
+    losses = [loss]
+    mse_losses = []
+    contrastive_losses = []
+    if mse_loss_fn is not None:
+        with torch.no_grad():
+            mse_losses.append(mse_loss_fn(merged_outputs, teacher_outputs, masks).item())
+    if contrastive_loss_fn is not None:
+        with torch.no_grad():
+            contrastive_losses.append(contrastive_loss_fn(merged_outputs, teacher_outputs, masks).item())
+
+    return losses, grad_norms, mse_losses, contrastive_losses
+
 def evaluate(
         merged_model,
         models,
@@ -330,13 +365,20 @@ def merge_model(
         weight_decay: float,
         seed: int,
         num_epochs: int = 1000,
+        training_mode: str = DEFAULT_TRAINING_MODE,
         wandb_project: Optional[str] = None,
         wandb_run_name: Optional[str] = None,
 ):
     source_metadata: list[dict] = [metadata for _, metadata in models]
     models: list[torch.nn.Module] = [model.eval() for model, _ in models]
-    model_hooks, model_outputs, model_inputs = register_hooks(models, hook_fn)
-    _ = [model.backbone(datasets[metadata['dataset']]) for model, metadata in zip(models, source_metadata)]
+    teacher_outputs = [model.backbone(datasets[metadata['dataset']]).detach() for model, metadata in zip(models, source_metadata)]
+    model_outputs = []
+    model_inputs = []
+    if training_mode == "layerwise":
+        model_hooks, model_outputs, model_inputs = register_hooks(models, hook_fn)
+        _ = [model.backbone(datasets[metadata['dataset']]) for model, metadata in zip(models, source_metadata)]
+    elif training_mode != "e2e":
+        raise ValueError(f"Unknown training mode: {training_mode}")
     optimizer = torch.optim.Adam(merged_model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     mse_loss = lambda merged_model_outputs, model_output, masks: torch.sum(
@@ -368,6 +410,7 @@ def merge_model(
         "mse_loss_weight": mse_loss_weight,
         "contrastive_loss_weight": contrastive_loss_weight,
         "subsample_ratio": subsample_ratio,
+        "training_mode": training_mode,
         "source_models": source_metadata
     }
 
@@ -402,15 +445,21 @@ def merge_model(
             f"{meta['dataset']}/{meta['chosen_class']}/{meta['num_classes']}"
             for meta in source_metadata
         ]
-        layer_names = list(model_outputs[0].keys())   # stable after first forward pass
+        layer_names = list(model_outputs[0].keys()) if training_mode == "layerwise" else ["final"]
         logger.info("wandb run initialised — prefixes: %s", model_prefixes)
 
     logger.info("starting model merging...")
     for epoch in range(num_epochs):
-        train_losses, grad_norms, mse_losses, contrastive_losses = train(
-            merged_model, model_outputs, model_inputs, subsampled_masks, optimizer, criterion,
-            contrastive_loss_fn=siglip_loss if contrastive_loss_weight > 0 else None,
-            mse_loss_fn=mse_loss if mse_loss_weight > 0 else None)
+        if training_mode == "layerwise":
+            train_losses, grad_norms, mse_losses, contrastive_losses = train(
+                merged_model, model_outputs, model_inputs, subsampled_masks, optimizer, criterion,
+                contrastive_loss_fn=siglip_loss if contrastive_loss_weight > 0 else None,
+                mse_loss_fn=mse_loss if mse_loss_weight > 0 else None)
+        else:
+            train_losses, grad_norms, mse_losses, contrastive_losses = train_e2e(
+                merged_model, teacher_outputs, datasets, source_metadata, subsampled_masks, optimizer, criterion,
+                contrastive_loss_fn=siglip_loss if contrastive_loss_weight > 0 else None,
+                mse_loss_fn=mse_loss if mse_loss_weight > 0 else None)
         train_accs, val_accs, test_accs = evaluate(merged_model, models, source_metadata, datasets, masks)
 
         # ---- internal logs (unchanged) ----
@@ -515,6 +564,14 @@ if __name__ == '__main__':
     parser.add_argument("--mse-loss-weight", type=float, help='how much to weigh mse loss?')
     parser.add_argument("--contrastive-loss-weight", type=float, help='how much to weigh contrastive loss?')
     parser.add_argument("--subsample-ratio", type=float, default=1.0, help="how many of each class to (sub)sample?")
+    parser.add_argument("--num-epochs", type=int, default=DEFAULT_EPOCHS, help="number of merge training epochs")
+    parser.add_argument(
+        "--training-mode",
+        type=str,
+        default=DEFAULT_TRAINING_MODE,
+        choices=["layerwise", "e2e"],
+        help="merge training strategy: per-layer teacher forcing or end-to-end final embedding matching",
+    )
     # wandb
     parser.add_argument("--wandb-project", type=str, default=None, help="wandb project name (omit to disable wandb)")
     parser.add_argument("--wandb-run-name", type=str, default=None, help="wandb run name (optional)")
@@ -583,6 +640,8 @@ if __name__ == '__main__':
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         seed=args.seed,
+        num_epochs=args.num_epochs,
+        training_mode=args.training_mode,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
     )
