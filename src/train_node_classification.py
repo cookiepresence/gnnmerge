@@ -15,32 +15,20 @@ Usage (example):
         --num-classes 2 --chosen-class 0
 """
 
-import json
 import logging
 import time
-from datetime import datetime
 from pathlib import Path
-from typing import Optional, Any, Literal
-import random
-
-from ogb.nodeproppred import PygNodePropPredDataset
+from typing import Optional
 
 import torch
 import torch.nn as nn
-import numpy as np
 import wandb
 
-from models import GCNBackbone, GNNComplete, GNNMLP, SageBackbone
 import utils as utils
 
-# fix for https://github.com/snap-stanford/ogb/issues/497
-###
-import torch
-from torch_geometric.data.storage import GlobalStorage
-from torch_geometric.data.data import DataEdgeAttr, DataTensorAttr
-
-torch.serialization.add_safe_globals([GlobalStorage, DataEdgeAttr, DataTensorAttr])
-####
+graph_size = utils.graph_size
+make_inductive_subgraph = utils.make_inductive_subgraph
+save_artifacts = utils.save
 
 # -------------------------
 # Configurable hyperparams
@@ -50,7 +38,6 @@ HIDDEN_DIM = 128
 LR = 5e-3
 WEIGHT_DECAY = 5e-4
 NUM_EPOCHS = 500
-LOG_TIME_FORMAT = "%Y%m%d_%H%M%S"
 
 # -------------------------
 # Logging setup
@@ -62,18 +49,6 @@ logging.basicConfig(
 datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("label-split-train")
-
-
-def save(path: Path, model: Optional[torch.nn.Module]=None, metadata: Optional[dict[str, Any]]=None, logs: Optional[dict]=None):
-    path.mkdir(parents=True, exist_ok=True)
-    if model is not None:
-        torch.save(model.state_dict(), path / "model.pt")
-    if metadata is not None:
-        metadata_file = path / "metadata.json"
-        metadata_file.write_text(json.dumps(metadata, indent=2))
-    if logs is not None:
-        log_file = path / "logs.json"
-        log_file.write_text(json.dumps(logs, indent=2))
 
 
 def train_step(model: torch.nn.Module, dataset, train_mask: torch.Tensor, optimizer, criterion) -> tuple[float, torch.Tensor]:
@@ -106,6 +81,7 @@ def train_model(
     # model related
     model: torch.nn.Module,
     hidden_dim: int,
+    num_layers: int,
     criterion,
     # data related
     dataset,
@@ -126,6 +102,7 @@ def train_model(
     model_type: str,
     ckpt_path: Path,
     seed: int,
+    split_mode: str,
     wandb_project: str,
     wandb_name: str
 ):
@@ -133,19 +110,22 @@ def train_model(
     Train one model and save the best checkpoint based on validation accuracy.
     Returns the logs dictionary.
     """
-    timestamp = datetime.now().strftime(LOG_TIME_FORMAT)
+    used_num_nodes, used_num_edges = graph_size(dataset)
 
     ckpt_path = ckpt_path
     config = {
         # model related
         "model_type": model_type,
         "hidden_dim": hidden_dim,
+        "num_layers": num_layers,
         "task": utils.Task.NodeClassification, # since the task is node classification
         # dataset related
         "dataset": dataset_name,
         "train_nodes": train_mask.sum().item(),
         "val_nodes": val_mask.sum().item(),
         "test_nodes": test_mask.sum().item(),
+        "used_num_nodes": used_num_nodes,
+        "used_num_edges": used_num_edges,
         "num_classes": num_classes,
         "chosen_class": chosen_class,
         "input_dim": input_dim,
@@ -154,7 +134,8 @@ def train_model(
         "learning_rate": lr,
         "weight_decay": weight_decay,
         "num_epochs": num_epochs,
-        "seed": seed
+        "seed": seed,
+        "split_mode": split_mode,
     }
 
     _ = wandb.init(
@@ -224,7 +205,7 @@ def train_model(
             config['val_acc'] = val_acc
             config['test_acc'] = test_acc
 
-            save(ckpt_path, model=model, metadata=config, logs=None)
+            save_artifacts(ckpt_path, merged_model=model, metadata=config, logs=None)
             logger.info("Saved best checkpoint to %s (val_acc=%.4f, test_acc=%.4f)", ckpt_path, val_acc, test_acc)
 
         if (epoch + 1) % 50 == 0 or epoch == 0 or (epoch + 1) == num_epochs:
@@ -236,7 +217,7 @@ def train_model(
     logs["total_training_time"] = total_time
 
     # save logs json
-    save(ckpt_path, logs=logs)
+    save_artifacts(ckpt_path, logs=logs)
 
     wandb.finish()
 
@@ -273,6 +254,12 @@ if __name__ == "__main__":
     p.add_argument("--lr", type=float, default=LR, help="Learning rate for model")
     p.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="Weight decay of model")
     p.add_argument("--hidden-dim", type=int, default=HIDDEN_DIM, help="Number of hidden dims")
+    p.add_argument("--num-layers", type=int, default=2, help="Number of GNN conv layers")
+    p.add_argument(
+        "--transductive",
+        action="store_true",
+        help="Use transductive training on the full graph (default: inductive subgraph training)",
+    )
     p.add_argument("--wandb-project", type=str, default="gnnmerge-repro", help="Name given to wandb project")
     p.add_argument("--wandb-name", required=True, type=str, help="Name given to wandb run")
     p.add_argument("--seed", type=int, default=SEED, help="seed used for reproduction")
@@ -287,13 +274,30 @@ if __name__ == "__main__":
     dataset = dataset.to(utils.get_device())
     masks = utils.make_label_masks(dataset, num_nodes, num_labels, num_classes=args.num_classes)
     train_mask, val_mask, test_mask = masks[args.chosen_class]
-    dataset = dataset.to(device)
+    split_mode = "transductive" if args.transductive else "inductive"
+    if args.transductive:
+        dataset = dataset.to(device)
+        train_mask = train_mask.to(device)
+        val_mask = val_mask.to(device)
+        test_mask = test_mask.to(device)
+    else:
+        dataset, (train_mask, val_mask, test_mask) = make_inductive_subgraph(
+            dataset,
+            (train_mask, val_mask, test_mask),
+        )
+        dataset = dataset.to(device)
+        train_mask = train_mask.to(device)
+        val_mask = val_mask.to(device)
+        test_mask = test_mask.to(device)
+    logger.info("Split mode: %s", split_mode)
+    used_nodes, used_edges = graph_size(dataset)
+    logger.info("Graph used for training: nodes=%d edges=%d", used_nodes, used_edges)
 
     print(dataset.y)
 
     num_masked_labels: int = utils.labels_in_class(args.chosen_class, num_labels, args.num_classes)
     logger.info(f"num of labels used: {num_masked_labels} (out of {num_labels})")
-    model = utils.build_model(args.model, input_dim, num_masked_labels, device, args.hidden_dim)
+    model = utils.build_model(args.model, input_dim, num_masked_labels, device, args.hidden_dim, num_layers=args.num_layers)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()
 
@@ -301,6 +305,7 @@ if __name__ == "__main__":
         model=model,
         model_type=args.model,
         hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
 
         dataset=dataset,
         dataset_name=args.dataset,
@@ -319,6 +324,7 @@ if __name__ == "__main__":
         weight_decay=args.weight_decay,
 
         seed=args.seed,
+        split_mode=split_mode,
         wandb_project=args.wandb_project,
         ckpt_path=args.save_path,
         wandb_name=args.wandb_name

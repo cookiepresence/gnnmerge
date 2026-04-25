@@ -24,7 +24,6 @@ from typing import Optional, Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 import utils
 
@@ -168,20 +167,6 @@ def evaluate_partition(
         # print([(m == 0).sum(dim=1, dtype=float).mean() for m in model_embeds])
         # print([(m == 0).sum(dim=1, dtype=float).mean() for m in partitioned_embeds])
         # print([m.tolist() for m in masks])
-
-        partitioned_diff = [
-            torch.isclose(partition_embed[m[1]], model_embed[m[1]])
-            for partition_embed, model_embed, m in
-            zip(partitioned_embeds, model_embeds, dataset_masks)
-        ]
-        merged_diff = [
-            torch.isclose(merged_embed[m[1]], model_embed[m[1]])
-            for merged_embed, model_embed, m in
-            zip(merged_embeds, model_embeds, dataset_masks)
-        ]
-
-        # print([m.sum(dim=1, dtype=float).mean() for m in merged_diff])
-        # print([p.sum(dim=1, dtype=float).mean() for p in partitioned_diff])
 
         # reconstruction losses
         losses = [

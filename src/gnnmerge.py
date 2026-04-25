@@ -1,13 +1,13 @@
 import argparse
 import collections
+import enum
 from functools import partial
-import json
+import math
 import logging
 from pathlib import Path
 from typing import Iterable, Any, Optional
 
 import torch
-import torch_geometric
 import wandb
 
 import utils
@@ -17,6 +17,7 @@ DEFAULT_LR = 5e-2
 DEFAULT_WD = 0.
 DEFAULT_EPOCHS = 1000
 DEFAULT_TRAINING_MODE = "layerwise"
+DEFAULT_SOFT_LABEL_TEMPERATURE = 1.0
 
 
 # -------------------------
@@ -28,6 +29,19 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("gnn-merge")
+
+
+class SubsampleMode(enum.StrEnum):
+    # Keep roughly ratio-per-class from true labels, sampled uniformly within each class.
+    GT_CLASS_STRATIFIED_RANDOM = "gt_class_stratified_random"
+    # Keep ratio-per-class from true labels, but bias picks toward parent confidence
+    # for that same class (soft_labels[node, class]).
+    PARENT_SOFT_LABEL_CLASS_STRATIFIED = "parent_soft_label_class_stratified"
+    # Ignore class balance and sample globally from all train nodes.
+    RANDOM_GLOBAL = "random_global"
+    # Keep ratio-per-class from true labels, but bias picks toward high-entropy
+    # parent predictions (more uncertain examples).
+    PARENT_ENTROPY_CLASS_STRATIFIED = "parent_entropy_class_stratified"
 
 
 def pad_dataset_features(data, target_dim: int):
@@ -85,25 +99,14 @@ def pad_model_first_layer(model, current_dim: int, target_dim: int, backbone_att
     return model
 
 
-def save(
-        path: Path,
-        merged_model: Optional[torch.nn.Module]=None,
-        models: Optional[list[torch.nn.Module]]=None,
-        metadata: Optional[dict[str, Any]]=None,
-        logs: Optional[dict]=None
-):
-    path.mkdir(parents=True, exist_ok=True)
-    if merged_model is not None:
-        torch.save(merged_model.state_dict(), path / "model.pt")
-    if models is not None:
-        for i, model in enumerate(models):
-            torch.save(model.state_dict(), path / f"model_{i}.pt")
-    if metadata is not None:
-        metadata_file = path / "metadata.json"
-        metadata_file.write_text(json.dumps(metadata, indent=2))
-    if logs is not None:
-        log_file = path / "logs.json"
-        log_file.write_text(json.dumps(logs, indent=2))
+def metadata_dataset_key(meta: dict[str, Any]) -> str:
+    return meta.get("dataset_key", meta["dataset"])
+
+
+make_inductive_subgraph = utils.make_inductive_subgraph
+graph_size = utils.graph_size
+resolve_split_mode = utils.resolve_split_mode
+save = utils.save
 
 
 def hook_fn(module, input, output, ins, outs, layer_name):
@@ -168,65 +171,191 @@ def register_hooks(
 
 #     return torch.mean(torch.sum(torch.stack(losses), dim=0))
 
-def siglip_loss(
-    merged_model_outputs,
-    model_output,
-    masks,
-    temperature: float = 1.0,
-    normalize: bool = True,
+class SigLIPLoss(torch.nn.Module):
+    def __init__(
+            self,
+            normalize: bool = True,
+            init_logit_scale: float = 0.0,
+            init_logit_bias: float = 0.0,
+            max_logit_scale: float = math.log(100.0),
+    ) -> None:
+        super().__init__()
+        self.normalize = normalize
+        self.max_logit_scale = max_logit_scale
+        self.logit_scale = torch.nn.Parameter(torch.tensor(init_logit_scale, dtype=torch.float32))
+        self.logit_bias = torch.nn.Parameter(torch.tensor(init_logit_bias, dtype=torch.float32))
+
+    def forward(self, merged_model_outputs, model_output, masks):
+        losses = []
+
+        scale = self.logit_scale.clamp(max=self.max_logit_scale).exp()
+
+        for merged, orig, mask in zip(merged_model_outputs, model_output, masks):
+            sel = mask[0]
+
+            z1 = merged[sel]
+            z2 = orig[sel]
+
+            n = z1.shape[0]
+            if n == 0:
+                continue
+
+            if self.normalize:
+                z1 = torch.nn.functional.normalize(z1, dim=1)
+                z2 = torch.nn.functional.normalize(z2, dim=1)
+
+            logits = torch.matmul(z1, z2.T)
+            logits = logits * scale + self.logit_bias
+
+            labels = 2 * torch.eye(n, device=logits.device, dtype=logits.dtype) - 1
+            loss = -torch.nn.functional.logsigmoid(labels * logits).mean()
+            losses.append(loss)
+
+        if not losses:
+            return torch.tensor(0.0, device=utils.get_device())
+
+        return torch.mean(torch.stack(losses))
+
+def subsample_train_mask_random_global(
+        train_mask: torch.Tensor,
+        ratio: float,
+        generator: torch.Generator,
 ):
-    losses = []
+    # Random-global: choose k from all train nodes, independent of class.
+    # This can shift the label distribution compared to the original mask.
+    if ratio >= 1.0:
+        return train_mask
 
-    for merged, orig, mask in zip(merged_model_outputs, model_output, masks):
+    new_mask = torch.zeros_like(train_mask, dtype=torch.bool)
+    idx = train_mask.nonzero(as_tuple=False).view(-1)
+    if idx.numel() == 0:
+        return new_mask
 
-        sel = mask[0]
+    k = max(1, int(idx.numel() * ratio))
+    k = min(k, idx.numel())
+    perm = torch.randperm(idx.numel(), generator=generator, device=generator.device)
+    chosen = idx[perm[:k]]
+    new_mask[chosen] = True
+    return new_mask
 
-        z1 = merged[sel]
-        z2 = orig[sel]
 
-        n = z1.shape[0]
-        if n == 0:
+def _compute_subsample_k(n: int, ratio: float) -> int:
+    # Per bucket we keep at least one node (when bucket is non-empty), capped by n.
+    return min(max(1, int(n * ratio)), n)
+
+
+def _sample_from_indices(
+        idx: torch.Tensor,
+        k: int,
+        generator: torch.Generator,
+        scores: Optional[torch.Tensor] = None,
+        temperature: float = DEFAULT_SOFT_LABEL_TEMPERATURE,
+):
+    # Shared "sample k from idx without replacement" primitive.
+    # - scores=None: uniform sample.
+    # - scores provided: weighted sample via softmax(log(score)/temperature).
+    #   Lower temperature sharpens toward high-score nodes.
+    if k >= idx.numel():
+        return idx
+    if scores is None:
+        perm = torch.randperm(idx.numel(), generator=generator, device=generator.device)
+        return idx[perm[:k]]
+    probs = torch.softmax(torch.log(scores.clamp_min(1e-12)) / temperature, dim=0)
+    chosen_rel = torch.multinomial(probs, num_samples=k, replacement=False, generator=generator)
+    return idx[chosen_rel]
+
+
+def _subsample_train_mask_class_stratified(
+        labels: torch.Tensor,
+        train_mask: torch.Tensor,
+        ratio: float,
+        generator: torch.Generator,
+        score_fn=None,
+        temperature: float = DEFAULT_SOFT_LABEL_TEMPERATURE,
+):
+    # Class-stratified template:
+    # 1) iterate over classes present in train_mask
+    # 2) sample k ~= ratio * class_count for each class
+    # 3) optional score_fn adds within-class weighting
+    # This preserves class coverage while allowing importance bias inside each class.
+    if ratio >= 1.0:
+        return train_mask
+    new_mask = torch.zeros_like(train_mask, dtype=torch.bool)
+    for c in labels[train_mask].unique():
+        idx = ((labels == c) & train_mask).nonzero(as_tuple=False).view(-1)
+        if idx.numel() == 0:
             continue
+        k = _compute_subsample_k(idx.numel(), ratio)
+        scores = score_fn(int(c.item()), idx) if score_fn is not None else None
+        new_mask[_sample_from_indices(idx, k, generator, scores=scores, temperature=temperature)] = True
+    return new_mask
 
-        if normalize:
-            z1 = torch.nn.functional.normalize(z1, dim=1)
-            z2 = torch.nn.functional.normalize(z2, dim=1)
 
-        logits = torch.matmul(z1, z2.T) / temperature
-
-        targets = 2 * torch.eye(n, device=logits.device) - torch.ones(n, device=logits.device)
-
-        loss = (
-            torch.nn.functional.binary_cross_entropy_with_logits(logits, targets)
-            # + torch.nn.functional.binary_cross_entropy_with_logits(logits.T, targets)
-        ) # / 2
-
-        losses.append(loss)
-
-    return torch.mean(torch.stack(losses))
-
-def subsample_train_mask_by_class(
+def subsample_train_mask_gt_class_stratified_random(
         labels: torch.Tensor,
         train_mask: torch.Tensor,
         ratio: float,
         generator: torch.Generator,
 ):
-    if ratio >= 1.0:
-        return train_mask
+    # True-label stratified + uniform within each class.
+    return _subsample_train_mask_class_stratified(labels, train_mask, ratio, generator)
 
-    new_mask = torch.zeros_like(train_mask, dtype=torch.bool)
-    classes = labels.unique()
 
-    for c in classes:
-        idx = (labels == c) & train_mask
-        idx = idx.nonzero(as_tuple=False).view(-1)
-        if idx.numel() == 0:
-            continue
-        k = max(1, int(idx.numel() * ratio))
-        perm = idx[torch.randperm(idx.numel(), generator=generator, device=generator.device)]
-        chosen = perm[:k]
-        new_mask[chosen] = True
-    return new_mask
+def subsample_train_mask_parent_soft_label_class_stratified(
+        labels: torch.Tensor,
+        train_mask: torch.Tensor,
+        ratio: float,
+        soft_labels: torch.Tensor,
+        generator: torch.Generator,
+        soft_label_temperature: float = DEFAULT_SOFT_LABEL_TEMPERATURE,
+):
+    # True-label stratified, but within each class c, nodes with higher
+    # parent-predicted p(y=c) are sampled more often.
+    if soft_label_temperature <= 0:
+        raise ValueError("soft_label_temperature must be > 0")
+    if soft_labels.ndim != 2:
+        raise ValueError(f"Expected soft_labels with shape [num_nodes, num_classes], got {tuple(soft_labels.shape)}")
+    def score_fn(class_idx: int, idx: torch.Tensor) -> torch.Tensor:
+        if class_idx < 0 or class_idx >= soft_labels.shape[1]:
+            raise ValueError(
+                f"Label class index {class_idx} invalid for soft_labels with {soft_labels.shape[1]} columns"
+            )
+        return soft_labels[idx, class_idx]
+    return _subsample_train_mask_class_stratified(
+        labels,
+        train_mask,
+        ratio,
+        generator,
+        score_fn=score_fn,
+        temperature=soft_label_temperature,
+    )
+
+
+def subsample_train_mask_parent_entropy_class_stratified(
+        labels: torch.Tensor,
+        train_mask: torch.Tensor,
+        ratio: float,
+        soft_labels: torch.Tensor,
+        generator: torch.Generator,
+        soft_label_temperature: float = DEFAULT_SOFT_LABEL_TEMPERATURE,
+):
+    # True-label stratified, but within each class, sample by prediction entropy.
+    # Higher entropy => more uncertain parent prediction => higher sampling weight.
+    if soft_label_temperature <= 0:
+        raise ValueError("soft_label_temperature must be > 0")
+    if soft_labels.ndim != 2:
+        raise ValueError(f"Expected soft_labels with shape [num_nodes, num_classes], got {tuple(soft_labels.shape)}")
+    def score_fn(_class_idx: int, idx: torch.Tensor) -> torch.Tensor:
+        probs = soft_labels[idx].clamp_min(1e-12)
+        return -(probs * probs.log()).sum(dim=1).clamp_min(1e-12)
+    return _subsample_train_mask_class_stratified(
+        labels,
+        train_mask,
+        ratio,
+        generator,
+        score_fn=score_fn,
+        temperature=soft_label_temperature,
+    )
 
 def compute_grad_norms(model: torch.nn.Module) -> dict[str, float]:
     """
@@ -279,7 +408,8 @@ def train(
             with torch.no_grad():
                 contrastive_losses.append(contrastive_loss_fn(merged_model_outputs, model_output, masks).item())
 
-    torch.stack(losses).sum().backward()
+    [loss.backward() for loss in losses]
+    # torch.stack(losses).sum().backward()
     grad_norms = compute_grad_norms(merged_model)
     optimizer.step()
     return losses, grad_norms, mse_losses, contrastive_losses
@@ -298,7 +428,7 @@ def train_e2e(
     merged_model.train()
     optimizer.zero_grad()
 
-    merged_outputs = [merged_model(datasets[meta['dataset']]) for meta in metadata]
+    merged_outputs = [merged_model(datasets[metadata_dataset_key(meta)]) for meta in metadata]
     loss = criterion(merged_outputs, teacher_outputs, masks)
     loss.backward()
 
@@ -331,9 +461,9 @@ def evaluate(
     test_accs = []
 
     for i, (model, meta, mask) in enumerate(zip(models, metadata, masks)):
-        merged_output = merged_model(datasets[meta['dataset']])
+        merged_output = merged_model(datasets[metadata_dataset_key(meta)])
         predictions = model.mlp(merged_output).argmax(dim=1)
-        labels = datasets[meta['dataset']].y
+        labels = datasets[metadata_dataset_key(meta)].y
         correct = (predictions == labels).float()
 
         train_mask, val_mask, test_mask = mask
@@ -366,20 +496,27 @@ def merge_model(
         seed: int,
         num_epochs: int = 1000,
         training_mode: str = DEFAULT_TRAINING_MODE,
+        subsample_mode: str = SubsampleMode.GT_CLASS_STRATIFIED_RANDOM.value,
+        soft_label_temperature: float = DEFAULT_SOFT_LABEL_TEMPERATURE,
         wandb_project: Optional[str] = None,
         wandb_run_name: Optional[str] = None,
 ):
     source_metadata: list[dict] = [metadata for _, metadata in models]
     models: list[torch.nn.Module] = [model.eval() for model, _ in models]
-    teacher_outputs = [model.backbone(datasets[metadata['dataset']]).detach() for model, metadata in zip(models, source_metadata)]
+    teacher_outputs = [model.backbone(datasets[metadata_dataset_key(metadata)]).detach() for model, metadata in zip(models, source_metadata)]
+    parent_soft_labels = [torch.softmax(model.mlp(output), dim=1).detach() for model, output in zip(models, teacher_outputs)]
     model_outputs = []
     model_inputs = []
     if training_mode == "layerwise":
         model_hooks, model_outputs, model_inputs = register_hooks(models, hook_fn)
-        _ = [model.backbone(datasets[metadata['dataset']]) for model, metadata in zip(models, source_metadata)]
+        _ = [model.backbone(datasets[metadata_dataset_key(metadata)]) for model, metadata in zip(models, source_metadata)]
     elif training_mode != "e2e":
         raise ValueError(f"Unknown training mode: {training_mode}")
-    optimizer = torch.optim.Adam(merged_model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    siglip = SigLIPLoss().to(utils.get_device()) if contrastive_loss_weight > 0 else None
+    optimizer_params = list(merged_model.parameters())
+    if siglip is not None:
+        optimizer_params.extend(siglip.parameters())
+    optimizer = torch.optim.Adam(optimizer_params, lr=learning_rate, weight_decay=weight_decay)
 
     mse_loss = lambda merged_model_outputs, model_output, masks: torch.sum(
         torch.stack([
@@ -387,17 +524,6 @@ def merge_model(
             for merged, orig, mask in zip(merged_model_outputs, model_output, masks)
         ])
     )
-
-    match (mse_loss_weight, contrastive_loss_weight):
-        case (0, w):
-            criterion = siglip_loss
-        case (w, 0):
-            criterion = mse_loss
-        case (w_mse, w_cl):
-            criterion = lambda merged_model_outputs, model_output, masks: (
-                w_mse * mse_loss(merged_model_outputs, model_output, masks)
-                + w_cl * siglip_loss(merged_model_outputs, model_output, masks)
-            )
 
     metadata = {
         "weight_decay": weight_decay,
@@ -407,26 +533,76 @@ def merge_model(
         "model_type": source_metadata[0]['model_type'],
         "input_dim": source_metadata[0]['input_dim'],
         "hidden_dim": source_metadata[0]['hidden_dim'],
+        "num_layers": source_metadata[0].get('num_layers', 2),
         "mse_loss_weight": mse_loss_weight,
         "contrastive_loss_weight": contrastive_loss_weight,
         "subsample_ratio": subsample_ratio,
+        "subsample_mode": subsample_mode,
+        "soft_label_temperature": soft_label_temperature,
         "training_mode": training_mode,
         "source_models": source_metadata
     }
 
     logs = collections.defaultdict(list)
-    save(save_path, None, models, metadata, None)
+    aux_state = {"contrastive_head": siglip.state_dict()} if siglip is not None else None
+    save(save_path, None, models, metadata, None, aux_state=aux_state)
     best_val_accs = torch.tensor([0. for _ in models], device=utils.get_device())
 
-    labels = [datasets[meta['dataset']].y for meta in source_metadata]
-
     gen = torch.Generator(device=utils.get_device())
-    gen.manual_seed(DEFAULT_SEED)
+    gen.manual_seed(seed)
 
     subsampled_masks = []
-    for (train_mask, val_mask, test_mask), y in zip(masks, labels):
-        sub_train = subsample_train_mask_by_class(y, train_mask, subsample_ratio, gen)
+    sampling_stats: list[dict[str, Any]] = []
+    for (train_mask, val_mask, test_mask), soft_labels, meta in zip(masks, parent_soft_labels, source_metadata):
+        labels = datasets[metadata_dataset_key(meta)].y
+        # Dispatch exactly one strategy per source model; resulting sub_train keeps
+        # only the selected training nodes while val/test masks stay unchanged.
+        if subsample_mode == SubsampleMode.GT_CLASS_STRATIFIED_RANDOM.value:
+            sub_train = subsample_train_mask_gt_class_stratified_random(
+                labels,
+                train_mask,
+                subsample_ratio,
+                gen,
+            )
+        elif subsample_mode == SubsampleMode.PARENT_SOFT_LABEL_CLASS_STRATIFIED.value:
+            sub_train = subsample_train_mask_parent_soft_label_class_stratified(
+                datasets[metadata_dataset_key(meta)].y,
+                train_mask,
+                subsample_ratio,
+                soft_labels,
+                gen,
+                soft_label_temperature=soft_label_temperature,
+            )
+        elif subsample_mode == SubsampleMode.RANDOM_GLOBAL.value:
+            sub_train = subsample_train_mask_random_global(train_mask, subsample_ratio, gen)
+        elif subsample_mode == SubsampleMode.PARENT_ENTROPY_CLASS_STRATIFIED.value:
+            sub_train = subsample_train_mask_parent_entropy_class_stratified(
+                labels,
+                train_mask,
+                subsample_ratio,
+                soft_labels,
+                gen,
+                soft_label_temperature=soft_label_temperature,
+            )
+        else:
+            raise ValueError(f"Unknown subsample mode: {subsample_mode}")
         subsampled_masks.append((sub_train, val_mask, test_mask))
+        sampling_stats.append(
+            {
+                "dataset": meta["dataset"],
+                "chosen_class": int(meta["chosen_class"]),
+                "before": int(train_mask.sum().item()),
+                "sampled": int(sub_train.sum().item()),
+            }
+        )
+    for stat in sampling_stats:
+        logger.info(
+            "Sampled train nodes (pre-train) | dataset=%s class=%d sampled=%d/%d",
+            stat["dataset"],
+            stat["chosen_class"],
+            stat["sampled"],
+            stat["before"],
+        )
 
     # ------------------------------------------------------------------
     # wandb: build a stable per-model metric prefix from dataset metadata
@@ -450,15 +626,30 @@ def merge_model(
 
     logger.info("starting model merging...")
     for epoch in range(num_epochs):
+        match (mse_loss_weight, contrastive_loss_weight):
+            case (0, w):
+                criterion = lambda merged_model_outputs, model_output, masks: (
+                    w * siglip(merged_model_outputs, model_output, masks)
+                )
+            case (w, 0):
+                criterion = lambda merged_model_outputs, model_output, masks: (
+                    w * mse_loss(merged_model_outputs, model_output, masks)
+                )
+            case (w_mse, w_cl):
+                criterion = lambda merged_model_outputs, model_output, masks: (
+                    w_mse * mse_loss(merged_model_outputs, model_output, masks)
+                    + w_cl * siglip(merged_model_outputs, model_output, masks)
+                )
+
         if training_mode == "layerwise":
             train_losses, grad_norms, mse_losses, contrastive_losses = train(
                 merged_model, model_outputs, model_inputs, subsampled_masks, optimizer, criterion,
-                contrastive_loss_fn=siglip_loss if contrastive_loss_weight > 0 else None,
+                contrastive_loss_fn=siglip if contrastive_loss_weight > 0 else None,
                 mse_loss_fn=mse_loss if mse_loss_weight > 0 else None)
         else:
             train_losses, grad_norms, mse_losses, contrastive_losses = train_e2e(
                 merged_model, teacher_outputs, datasets, source_metadata, subsampled_masks, optimizer, criterion,
-                contrastive_loss_fn=siglip_loss if contrastive_loss_weight > 0 else None,
+                contrastive_loss_fn=siglip if contrastive_loss_weight > 0 else None,
                 mse_loss_fn=mse_loss if mse_loss_weight > 0 else None)
         train_accs, val_accs, test_accs = evaluate(merged_model, models, source_metadata, datasets, masks)
 
@@ -471,6 +662,8 @@ def merge_model(
         if contrastive_loss_weight > 0:
             for i, loss in enumerate(contrastive_losses):
                 logs[f"train_contrastive_loss_{i}"].append(loss)
+            logs["contrastive_logit_scale"].append(siglip.logit_scale.detach().item())
+            logs["contrastive_logit_bias"].append(siglip.logit_bias.detach().item())
         for i, train_acc in enumerate(train_accs):
             logs[f"train_acc_{i}"].append(train_acc.item())
         for i, val_acc in enumerate(val_accs):
@@ -501,6 +694,8 @@ def merge_model(
                 for layer_idx, (layer_name, loss) in enumerate(zip(layer_names, contrastive_losses)):
                     for i, prefix in enumerate(model_prefixes):
                         wb_log[f"{prefix}/train_contrastive_loss/{layer_name}"] = loss
+                wb_log["contrastive/logit_scale"] = siglip.logit_scale.detach().item()
+                wb_log["contrastive/logit_bias"] = siglip.logit_bias.detach().item()
 
             # Grad norms — logged under grad_norm/<param_name> and grad_norm/total
             # These belong to the merged model, not to any individual source model,
@@ -516,7 +711,8 @@ def merge_model(
         # ---- checkpoint ----
         if torch.all(val_accs > best_val_accs):
             best_val_accs = val_accs.clone()
-            save(save_path, merged_model, None, None, logs)
+            aux_state = {"contrastive_head": siglip.state_dict()} if siglip is not None else None
+            save(save_path, merged_model, None, None, logs, aux_state=aux_state)
             logger.info(
                 "Saved best checkpoint to %s (train_acc=%s, val_acc=%s, test_acc=%s)",
                 save_path, train_accs.tolist(), val_accs.tolist(), test_accs.tolist()
@@ -542,8 +738,10 @@ def merge_model(
 def build_merged_model(models, max_input_dim: int) -> torch.nn.Module:
     model_type: list[str] = [metadata['model_type'] for _, metadata in models]
     hidden_dims: list[int] = [metadata['hidden_dim'] for _, metadata in models]
+    num_layers: list[int] = [int(metadata.get('num_layers', 2)) for _, metadata in models]
     assert all([m == model_type[0] for m in model_type])
     assert all([dim == hidden_dims[0] for dim in hidden_dims])
+    assert all([nl == num_layers[0] for nl in num_layers])
 
     hidden_dim = hidden_dims[0]
     return utils.build_model(
@@ -551,7 +749,8 @@ def build_merged_model(models, max_input_dim: int) -> torch.nn.Module:
         input_dim=max_input_dim,
         num_labels=None,
         device=utils.get_device(),
-        hidden_dim=hidden_dim
+        hidden_dim=hidden_dim,
+        num_layers=num_layers[0],
     )
 
 if __name__ == '__main__':
@@ -564,7 +763,26 @@ if __name__ == '__main__':
     parser.add_argument("--mse-loss-weight", type=float, help='how much to weigh mse loss?')
     parser.add_argument("--contrastive-loss-weight", type=float, help='how much to weigh contrastive loss?')
     parser.add_argument("--subsample-ratio", type=float, default=1.0, help="how many of each class to (sub)sample?")
+    parser.add_argument(
+        "--subsample-mode",
+        type=str,
+        default=SubsampleMode.GT_CLASS_STRATIFIED_RANDOM.value,
+        choices=[m.value for m in SubsampleMode],
+        help="subsampling strategy for selecting train nodes",
+    )
+    parser.add_argument(
+        "--soft-label-temperature",
+        type=float,
+        default=DEFAULT_SOFT_LABEL_TEMPERATURE,
+        help="temperature for parent_soft_labels subsampling (lower favors high-confidence nodes)",
+    )
     parser.add_argument("--num-epochs", type=int, default=DEFAULT_EPOCHS, help="number of merge training epochs")
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=None,
+        help="number of GNN conv layers in the source checkpoints; inferred from metadata when omitted",
+    )
     parser.add_argument(
         "--training-mode",
         type=str,
@@ -576,6 +794,13 @@ if __name__ == '__main__':
     parser.add_argument("--wandb-project", type=str, default=None, help="wandb project name (omit to disable wandb)")
     parser.add_argument("--wandb-run-name", type=str, default=None, help="wandb run name (optional)")
     args = parser.parse_args()
+    if args.subsample_mode in {
+        SubsampleMode.PARENT_SOFT_LABEL_CLASS_STRATIFIED.value,
+        SubsampleMode.PARENT_ENTROPY_CLASS_STRATIFIED.value,
+    } and args.soft_label_temperature <= 0:
+        raise ValueError(
+            "--soft-label-temperature must be > 0 for soft-label or entropy-based subsampling modes"
+        )
 
     if args.model_path is None or args.save_path is None:
         parser.print_help()
@@ -587,6 +812,13 @@ if __name__ == '__main__':
 
     models = [utils.load_models(path, task=utils.Task.NodeClassification, device=device) for path in args.model_path]
     source_model_metadata = [metadata for _, metadata in models]
+    source_num_layers = int(source_model_metadata[0].get("num_layers", 2))
+    if args.num_layers is not None and args.num_layers != source_num_layers:
+        raise ValueError(
+            f"Requested num_layers={args.num_layers} does not match source checkpoints ({source_num_layers})"
+        )
+    if any(int(meta.get("num_layers", 2)) != source_num_layers for meta in source_model_metadata):
+        raise ValueError("All source models must have the same num_layers")
 
     dataset_names: list[str] = [metadata['dataset'] for metadata in source_model_metadata]
     datasets: dict[str, Any] = {
@@ -599,32 +831,73 @@ if __name__ == '__main__':
     logger.info(f"Input dimensions: {input_dims}")
     logger.info(f"Maximum input dimension: {max_input_dim}")
 
-    dataset_objs = {}
+    split_mode = resolve_split_mode(source_model_metadata)
+    logger.info("Split mode: %s", split_mode)
+
+    base_dataset_objs = {}
     for ds in set(dataset_names):
         data = datasets[ds][0].to(device)
         data = pad_dataset_features(data, max_input_dim)
-        dataset_objs[ds] = data
+        base_dataset_objs[ds] = data
+        base_nodes, base_edges = graph_size(data)
+        logger.info("Base graph | dataset=%s nodes=%d edges=%d", ds, base_nodes, base_edges)
 
     logger.info("Padding source models to accept max input dimension...")
-    padded_models = []
+    padded_models: list[tuple[torch.nn.Module, dict[str, Any]]] = []
     for (model, metadata) in models:
         current_input_dim = metadata['input_dim']
         if current_input_dim < max_input_dim:
             model = pad_model_first_layer(model, current_input_dim, max_input_dim)
-        padded_models.append((model, metadata))
+        padded_models.append((model, dict(metadata)))
 
     models = padded_models
 
     all_masks = {}
-    model_masks = []
-    for metadata in source_model_metadata:
+    dataset_objs: dict[str, Any] = {}
+    model_masks: list[utils.MaskType] = []
+    final_models: list[tuple[torch.nn.Module, dict[str, Any]]] = []
+    for model_idx, (model, metadata) in enumerate(models):
         dataset_name = metadata['dataset']
         if dataset_name not in all_masks:
             masks = utils.make_label_masks(*(datasets[dataset_name][:-1]), num_classes=metadata['num_classes'])
             all_masks[dataset_name] = masks
-        model_masks.append(all_masks[dataset_name][metadata['chosen_class']])
+        base_dataset_objs[dataset_name].y = datasets[dataset_name][0].y.to(device)
+        split_mask = all_masks[dataset_name][metadata['chosen_class']]
+        match split_mode:
+            case 'transductive':
+                dataset_key = dataset_name
+                if dataset_key not in dataset_objs:
+                    dataset_objs[dataset_key] = base_dataset_objs[dataset_name]
+            case 'inductive':
+                dataset_key = f"{dataset_name}__class{metadata['chosen_class']}__model{model_idx}"
+                split_data, split_mask = make_inductive_subgraph(
+                    base_dataset_objs[dataset_name],
+                    split_mask,
+                )
+                dataset_objs[dataset_key] = split_data
 
-    model_masks = [tuple(m.to(device) for m in mask) for mask in model_masks]
+        used_nodes, used_edges = graph_size(dataset_objs[dataset_key])
+        logger.info(
+            "Graph used for merge | dataset=%s class=%d mode=%s nodes=%d edges=%d",
+            dataset_name,
+            int(metadata["chosen_class"]),
+            split_mode,
+            used_nodes,
+            used_edges,
+        )
+
+        train_mask, val_mask, test_mask = split_mask
+        model_masks.append((
+            train_mask.to(device),
+            val_mask.to(device),
+            test_mask.to(device),
+        ))
+
+        metadata["dataset_key"] = dataset_key
+        metadata["split_mode"] = split_mode
+        final_models.append((model, metadata))
+
+    models = final_models
 
     merged_model = build_merged_model(models, max_input_dim)
 
@@ -635,6 +908,8 @@ if __name__ == '__main__':
         dataset_objs,
         model_masks,
         subsample_ratio=args.subsample_ratio,
+        subsample_mode=args.subsample_mode,
+        soft_label_temperature=args.soft_label_temperature,
         mse_loss_weight=args.mse_loss_weight,
         contrastive_loss_weight=args.contrastive_loss_weight,
         learning_rate=args.lr,

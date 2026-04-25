@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 from models import GCNBackbone, GNNMLP, GNNComplete, SageBackbone
 from functools import partial
-import gc
-import sys
 import time
 import os
 import json
@@ -217,7 +215,7 @@ def main():
             param.requires_grad = False
     
     # Perform merging
-    logs = merge_model(
+    merge_model(
         models = models,  merged_backbone=merged_backbone,
         datasets=datasets, num_layers=2,
         dataset_names=args.dataset_names, model_name=args.model_name,

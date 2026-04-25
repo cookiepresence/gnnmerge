@@ -1,10 +1,6 @@
 import torch
-import torch.nn as nn
 from models import GCNBackbone, GNNMLP, GNNComplete, SageBackbone
 from functools import partial
-import gc
-import sys
-import time
 import os
 import json
 import argparse
@@ -145,7 +141,6 @@ def merge_model(models, merged_backbone, datasets, num_layers, dataset_names, mo
         logs[f'val_acc{i+1}'] = []
         logs[f'test_acc{i+1}'] = []
 
-    total_time = 0
 
     num_models = len(models)  # Number of models
     model_inputs = [{} for _ in range(num_models)]
@@ -214,7 +209,7 @@ def main():
             param.requires_grad = False
     
     # Perform merging
-    logs = merge_model(
+    merge_model(
         models = models,  merged_backbone=merged_backbone,
         datasets=datasets, num_layers=2,
         dataset_names=args.dataset_names, model_name=args.model_name,

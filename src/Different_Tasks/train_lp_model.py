@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from models import GCNBackbone, SageBackbone
 from torch_geometric.utils import negative_sampling

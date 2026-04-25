@@ -8,20 +8,24 @@ from torch_geometric.data import Data
 
 
 class GCNBackbone(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int) -> None:
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int = 2) -> None:
         super(GCNBackbone, self).__init__()
+        if num_layers < 2:
+            raise ValueError("GCNBackbone requires num_layers >= 2")
+        self.num_layers = num_layers
         self.conv1: GCNConv = GCNConv(input_dim, hidden_dim)
-        self.conv2: GCNConv = GCNConv(hidden_dim, hidden_dim)
+        for i in range(2, num_layers + 1):
+            setattr(self, f"conv{i}", GCNConv(hidden_dim, hidden_dim))
 
     def forward(self, data: Data) -> Tensor:
         x: Tensor = data.x.to(dtype=torch.float32)
         edge_index: Tensor = data.edge_index
         if hasattr(data, 'train_pos_edge_index'):
             edge_index = data.train_pos_edge_index
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = self.conv2(x, edge_index)
-        x = F.relu(x)
+        for i in range(1, self.num_layers + 1):
+            layer = getattr(self, f"conv{i}")
+            x = layer(x, edge_index)
+            x = F.relu(x)
         return x
 
     def decode(self, z: Tensor, edge_index: Tensor) -> Tensor:
@@ -30,20 +34,24 @@ class GCNBackbone(nn.Module):
 
 
 class SageBackbone(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int) -> None:
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int = 2) -> None:
         super(SageBackbone, self).__init__()
+        if num_layers < 2:
+            raise ValueError("SageBackbone requires num_layers >= 2")
+        self.num_layers = num_layers
         self.conv1: SAGEConv = SAGEConv(input_dim, hidden_dim)
-        self.conv2: SAGEConv = SAGEConv(hidden_dim, hidden_dim)
+        for i in range(2, num_layers + 1):
+            setattr(self, f"conv{i}", SAGEConv(hidden_dim, hidden_dim))
 
     def forward(self, data: Data) -> Tensor:
         x: Tensor = data.x.to(dtype=torch.float32)
         edge_index: Tensor = data.edge_index
         if hasattr(data, 'train_pos_edge_index'):
             edge_index = data.train_pos_edge_index
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = self.conv2(x, edge_index)
-        x = F.relu(x)
+        for i in range(1, self.num_layers + 1):
+            layer = getattr(self, f"conv{i}")
+            x = layer(x, edge_index)
+            x = F.relu(x)
         return x
 
     def decode(self, z: Tensor, edge_index: Tensor) -> Tensor:

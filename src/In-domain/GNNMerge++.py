@@ -1,11 +1,7 @@
 import torch
-import torch.nn as nn
 from models import GCNBackbone, GNNMLP, GNNComplete, SageBackbone
 from functools import partial
-import gc
-import sys
 import math
-import time
 import os
 import json
 import argparse
@@ -59,11 +55,6 @@ def create_masks(dataset):
     val_indices = dataset.val_masks[0]
     test_indices = dataset.test_masks[0]
     
-    # Get labels for these indices
-    train_labels = dataset.y[train_indices]
-    val_labels = dataset.y[val_indices]
-    test_labels = dataset.y[test_indices]
-
     # Create a copy of the original labels before modifying
     original_y = dataset.y.clone()
 
@@ -188,7 +179,6 @@ def merge_model(model1, model2, model3_backbone, dataset, num_layers, train_mask
         'normalized_val' : [],
         'normalized_test' : [],
     }
-    total_time = 0
 
     model1_outputs = {}
     model1_inputs = {}
@@ -276,7 +266,7 @@ def main():
     train_mask1, train_mask2, val_mask1, val_mask2, test_mask1, test_mask2 = [m.to(device) for m in masks[:6]]
     
     # Perform merging
-    logs = merge_model(
+    merge_model(
         model1=model1, model2=model2, model3_backbone=model3_backbone,
         dataset=dataset, num_layers=2,
         train_mask1=train_mask1, train_mask2=train_mask2,

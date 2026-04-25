@@ -2,10 +2,7 @@ import torch
 import torch.nn as nn
 from models import GCNBackbone, GNNMLP, GNNComplete, SageBackbone
 from functools import partial
-from torch_geometric.utils import negative_sampling
 from sklearn.metrics import roc_auc_score
-import gc
-import sys
 import time
 import os
 import json
@@ -253,7 +250,7 @@ def main():
     lp_train_data, lp_val_data, lp_test_data = transform(lp_dataset)
 
     # Perform merging
-    logs = merge_model(
+    merge_model(
         nc_model = nc_model, lp_model = lp_model, merged_backbone = model3_backbone,
         nc_dataset=nc_dataset, lp_dataset = lp_train_data, lp_val_data = lp_val_data, lp_test_data = lp_test_data, num_layers=2,
         nc_dataset_name=args.nc_dataset_name, lp_dataset_name = args.lp_dataset_name, model_name=args.model_name,

@@ -1,12 +1,11 @@
 from pathlib import Path
 import enum
 import json
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import random
 import numpy as np
 import torch
-import torch_geometric
 
 import models as models
 
@@ -35,12 +34,13 @@ def build_model(
         input_dim: int,
         num_labels: Optional[int],
         device: torch.device,
-        hidden_dim: int
+        hidden_dim: int,
+        num_layers: int = 2,
 ) -> torch.nn.Module:
     if model_name == 'gcn':
-        backbone = models.GCNBackbone(input_dim, hidden_dim).to(device)
+        backbone = models.GCNBackbone(input_dim, hidden_dim, num_layers=num_layers).to(device)
     elif model_name == 'sage':
-        backbone = models.SageBackbone(input_dim, hidden_dim).to(device)
+        backbone = models.SageBackbone(input_dim, hidden_dim, num_layers=num_layers).to(device)
     else:
         raise ValueError(f"Unknown model type: {model_name!r}")
 
@@ -59,6 +59,7 @@ def load_model_raw(weight: Path, metadata: dict, device: torch.device):
         model_name=metadata["model_type"],
         input_dim=metadata["input_dim"],
         hidden_dim=metadata["hidden_dim"],
+        num_layers=metadata.get("num_layers", 2),
         num_labels=metadata.get("num_labels", None),
         device=device,
     )
@@ -88,6 +89,72 @@ def load_dataset(path: Path):
     num_labels = int(len(ds.label_names))
     input_dim = int(ds.x.size(1))
     return ds, num_nodes, num_labels, input_dim
+
+
+def graph_size(data) -> tuple[int, int]:
+    num_nodes = int(getattr(data, "num_nodes", 0))
+    if hasattr(data, "num_edges") and data.num_edges is not None:
+        num_edges = int(data.num_edges)
+    elif hasattr(data, "edge_index") and data.edge_index is not None:
+        num_edges = int(data.edge_index.size(1))
+    else:
+        num_edges = 0
+    return num_nodes, num_edges
+
+
+def make_inductive_subgraph(data, mask: "MaskType") -> tuple[Any, "MaskType"]:
+    train_mask, val_mask, test_mask = mask
+    subset = train_mask | val_mask | test_mask
+    subgraph_data = data.subgraph(subset)
+    subgraph_mask = (
+        train_mask[subset],
+        val_mask[subset],
+        test_mask[subset],
+    )
+    return subgraph_data, subgraph_mask
+
+
+def resolve_split_mode(source_metadata: list[dict[str, Any]]) -> str:
+    if force_transductive:
+        return "transductive"
+
+    known_modes = {
+        str(meta.get("split_mode"))
+        for meta in source_metadata
+        if meta.get("split_mode") in {"inductive", "transductive"}
+    }
+    if len(known_modes) == 1:
+        return next(iter(known_modes))
+    if len(known_modes) > 1:
+        raise ValueError(f"Inconsistent split_mode across source checkpoints: {sorted(known_modes)}")
+
+    # Backward-compat fallback for older checkpoints that did not store split_mode.
+    return "inductive"
+
+
+def save(
+    path: Path,
+    merged_model: Optional[torch.nn.Module] = None,
+    models: Optional[list[torch.nn.Module]] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    logs: Optional[dict] = None,
+    aux_state: Optional[dict[str, dict[str, torch.Tensor]]] = None,
+):
+    path.mkdir(parents=True, exist_ok=True)
+    if merged_model is not None:
+        torch.save(merged_model.state_dict(), path / "model.pt")
+    if models is not None:
+        for i, model in enumerate(models):
+            torch.save(model.state_dict(), path / f"model_{i}.pt")
+    if aux_state is not None:
+        for name, state_dict in aux_state.items():
+            torch.save(state_dict, path / f"{name}.pt")
+    if metadata is not None:
+        metadata_file = path / "metadata.json"
+        metadata_file.write_text(json.dumps(metadata, indent=2))
+    if logs is not None:
+        log_file = path / "logs.json"
+        log_file.write_text(json.dumps(logs, indent=2))
 
 def labels_in_class(class_idx: int, num_labels: int, num_classes: int):
     start = (class_idx * num_labels) // num_classes
