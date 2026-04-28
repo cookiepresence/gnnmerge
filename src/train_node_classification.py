@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import wandb
 
+import task_evaluation
 import utils as utils
 
 graph_size = utils.graph_size
@@ -70,10 +71,7 @@ def evaluate(model: torch.nn.Module, data, mask: torch.Tensor, criterion) -> tup
     if mask.sum().item() == 0:
         return 0.0, 0.0
     loss = float(criterion(out[mask], data.y[mask]).item())
-    pred = out.argmax(dim=1)
-    correct = int((pred[mask] == data.y[mask]).sum().item())
-    total = int(mask.sum().item())
-    acc = float(correct) / float(total) if total > 0 else 0.0
+    acc = task_evaluation.node_classification_accuracy(out, data.y, mask)
     return acc, loss
 
 
@@ -297,6 +295,7 @@ if __name__ == "__main__":
 
     num_masked_labels: int = utils.labels_in_class(args.chosen_class, num_labels, args.num_classes)
     logger.info(f"num of labels used: {num_masked_labels} (out of {num_labels})")
+    print_split_summary(dataset, (train_mask, val_mask, test_mask))
     model = utils.build_model(args.model, input_dim, num_masked_labels, device, args.hidden_dim, num_layers=args.num_layers)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()

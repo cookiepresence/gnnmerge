@@ -102,9 +102,21 @@ def graph_size(data) -> tuple[int, int]:
     return num_nodes, num_edges
 
 
-def make_inductive_subgraph(data, mask: "MaskType") -> tuple[Any, "MaskType"]:
+
+def make_inductive_subgraph(data, mask):
     train_mask, val_mask, test_mask = mask
-    subset = train_mask | val_mask | test_mask
+    subset = (train_mask | val_mask | test_mask).nonzero(as_tuple=False).view(-1)
+
+    if hasattr(data, 'adj_t') and data.adj_t is not None:
+        data = copy.copy(data)
+        # adj_t is the transposed adjacency: its COO (row, col) = (dst, src)
+        # so flip to get (src, dst) for edge_index
+        dst, src, val = data.adj_t.coo()
+        data.edge_index = torch.stack([src, dst], dim=0)
+        if val is not None:
+            data.edge_attr = val
+        del data.adj_t
+
     subgraph_data = data.subgraph(subset)
     subgraph_mask = (
         train_mask[subset],
@@ -113,11 +125,7 @@ def make_inductive_subgraph(data, mask: "MaskType") -> tuple[Any, "MaskType"]:
     )
     return subgraph_data, subgraph_mask
 
-
 def resolve_split_mode(source_metadata: list[dict[str, Any]]) -> str:
-    if force_transductive:
-        return "transductive"
-
     known_modes = {
         str(meta.get("split_mode"))
         for meta in source_metadata
@@ -129,7 +137,7 @@ def resolve_split_mode(source_metadata: list[dict[str, Any]]) -> str:
         raise ValueError(f"Inconsistent split_mode across source checkpoints: {sorted(known_modes)}")
 
     # Backward-compat fallback for older checkpoints that did not store split_mode.
-    return "inductive"
+    return "transductive"
 
 
 def save(
