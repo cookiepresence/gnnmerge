@@ -18,6 +18,7 @@ DEFAULT_WD = 0.
 DEFAULT_EPOCHS = 1000
 DEFAULT_TRAINING_MODE = "layerwise"
 DEFAULT_SOFT_LABEL_TEMPERATURE = 1.0
+DEFAULT_KL_TEMPERATURE = 1.0
 
 
 # -------------------------
@@ -384,12 +385,14 @@ def train(
         criterion,
         mse_loss_fn=None,
         contrastive_loss_fn=None,
+        kl_loss_fn=None,
 ):
     merged_model.train()
     optimizer.zero_grad()
     losses = []
     mse_losses = []
     contrastive_losses = []
+    kl_losses = []
 
     for layer in model_outputs[0].keys():
         model_output = [outputs[layer] for outputs in model_outputs]
@@ -407,12 +410,15 @@ def train(
         if contrastive_loss_fn is not None:
             with torch.no_grad():
                 contrastive_losses.append(contrastive_loss_fn(merged_model_outputs, model_output, masks).item())
+        if kl_loss_fn is not None:
+            with torch.no_grad():
+                kl_losses.append(kl_loss_fn(merged_model_outputs, model_output, masks).item())
 
-    [loss.backward() for loss in losses]
-    # torch.stack(losses).sum().backward()
+    # [loss.backward() for loss in losses]
+    torch.stack(losses).sum().backward()
     grad_norms = compute_grad_norms(merged_model)
     optimizer.step()
-    return losses, grad_norms, mse_losses, contrastive_losses
+    return losses, grad_norms, mse_losses, contrastive_losses, kl_losses
 
 def train_e2e(
         merged_model: torch.nn.Module,
@@ -424,6 +430,7 @@ def train_e2e(
         criterion,
         mse_loss_fn=None,
         contrastive_loss_fn=None,
+        kl_loss_fn=None,
 ):
     merged_model.train()
     optimizer.zero_grad()
@@ -431,21 +438,24 @@ def train_e2e(
     merged_outputs = [merged_model(datasets[metadata_dataset_key(meta)]) for meta in metadata]
     loss = criterion(merged_outputs, teacher_outputs, masks)
     loss.backward()
-
     grad_norms = compute_grad_norms(merged_model)
     optimizer.step()
 
     losses = [loss]
     mse_losses = []
     contrastive_losses = []
+    kl_losses = []
     if mse_loss_fn is not None:
         with torch.no_grad():
             mse_losses.append(mse_loss_fn(merged_outputs, teacher_outputs, masks).item())
     if contrastive_loss_fn is not None:
         with torch.no_grad():
             contrastive_losses.append(contrastive_loss_fn(merged_outputs, teacher_outputs, masks).item())
+    if kl_loss_fn is not None:
+        with torch.no_grad():
+            kl_losses.append(kl_loss_fn(merged_outputs, teacher_outputs, masks).item())
 
-    return losses, grad_norms, mse_losses, contrastive_losses
+    return losses, grad_norms, mse_losses, contrastive_losses, kl_losses
 
 def evaluate(
         merged_model,
@@ -491,6 +501,8 @@ def merge_model(
         subsample_ratio: float,
         mse_loss_weight: float,
         contrastive_loss_weight: float,
+        kl_loss_weight: float,
+        kl_temperature: float,
         learning_rate: float,
         weight_decay: float,
         seed: int,
@@ -501,6 +513,11 @@ def merge_model(
         wandb_project: Optional[str] = None,
         wandb_run_name: Optional[str] = None,
 ):
+    if mse_loss_weight <= 0 and contrastive_loss_weight <= 0 and kl_loss_weight <= 0:
+        raise ValueError("At least one of mse_loss_weight, contrastive_loss_weight, or kl_loss_weight must be > 0")
+    if kl_loss_weight > 0 and kl_temperature <= 0:
+        raise ValueError("kl_temperature must be > 0 when kl_loss_weight > 0")
+
     source_metadata: list[dict] = [metadata for _, metadata in models]
     models: list[torch.nn.Module] = [model.eval() for model, _ in models]
     teacher_outputs = [model.backbone(datasets[metadata_dataset_key(metadata)]).detach() for model, metadata in zip(models, source_metadata)]
@@ -524,6 +541,24 @@ def merge_model(
             for merged, orig, mask in zip(merged_model_outputs, model_output, masks)
         ])
     )
+    def kl_loss(merged_model_outputs, model_output, masks):
+        losses = []
+        for merged, orig, mask in zip(merged_model_outputs, model_output, masks):
+            sel = mask[0]
+            if sel.sum().item() == 0:
+                continue
+            merged_log_probs = torch.nn.functional.log_softmax(merged[sel] / kl_temperature, dim=-1)
+            teacher_probs = torch.nn.functional.softmax(orig[sel] / kl_temperature, dim=-1)
+            losses.append(
+                torch.nn.functional.kl_div(
+                    merged_log_probs,
+                    teacher_probs,
+                    reduction="batchmean",
+                ) * (kl_temperature ** 2)
+            )
+        if not losses:
+            return torch.tensor(0.0, device=utils.get_device())
+        return torch.sum(torch.stack(losses))
 
     metadata = {
         "weight_decay": weight_decay,
@@ -536,6 +571,8 @@ def merge_model(
         "num_layers": source_metadata[0].get('num_layers', 2),
         "mse_loss_weight": mse_loss_weight,
         "contrastive_loss_weight": contrastive_loss_weight,
+        "kl_loss_weight": kl_loss_weight,
+        "kl_temperature": kl_temperature,
         "subsample_ratio": subsample_ratio,
         "subsample_mode": subsample_mode,
         "soft_label_temperature": soft_label_temperature,
@@ -624,34 +661,38 @@ def merge_model(
         layer_names = list(model_outputs[0].keys()) if training_mode == "layerwise" else ["final"]
         logger.info("wandb run initialised — prefixes: %s", model_prefixes)
 
+    def criterion(merged_model_outputs, model_output, masks):
+        loss_terms = []
+        if mse_loss_weight > 0:
+            loss_terms.append(mse_loss_weight * mse_loss(merged_model_outputs, model_output, masks))
+        if contrastive_loss_weight > 0:
+            loss_terms.append(contrastive_loss_weight * siglip(merged_model_outputs, model_output, masks))
+        if kl_loss_weight > 0:
+            loss_terms.append(kl_loss_weight * kl_loss(merged_model_outputs, model_output, masks))
+        return torch.stack(loss_terms).sum()
+
     logger.info("starting model merging...")
     for epoch in range(num_epochs):
-        match (mse_loss_weight, contrastive_loss_weight):
-            case (0, w):
-                criterion = lambda merged_model_outputs, model_output, masks: (
-                    w * siglip(merged_model_outputs, model_output, masks)
-                )
-            case (w, 0):
-                criterion = lambda merged_model_outputs, model_output, masks: (
-                    w * mse_loss(merged_model_outputs, model_output, masks)
-                )
-            case (w_mse, w_cl):
-                criterion = lambda merged_model_outputs, model_output, masks: (
-                    w_mse * mse_loss(merged_model_outputs, model_output, masks)
-                    + w_cl * siglip(merged_model_outputs, model_output, masks)
-                )
-
         if training_mode == "layerwise":
-            train_losses, grad_norms, mse_losses, contrastive_losses = train(
+            train_losses, grad_norms, mse_losses, contrastive_losses, kl_losses = train(
                 merged_model, model_outputs, model_inputs, subsampled_masks, optimizer, criterion,
                 contrastive_loss_fn=siglip if contrastive_loss_weight > 0 else None,
-                mse_loss_fn=mse_loss if mse_loss_weight > 0 else None)
+                mse_loss_fn=mse_loss if mse_loss_weight > 0 else None,
+                kl_loss_fn=kl_loss if kl_loss_weight > 0 else None)
         else:
-            train_losses, grad_norms, mse_losses, contrastive_losses = train_e2e(
+            train_losses, grad_norms, mse_losses, contrastive_losses, kl_losses = train_e2e(
                 merged_model, teacher_outputs, datasets, source_metadata, subsampled_masks, optimizer, criterion,
                 contrastive_loss_fn=siglip if contrastive_loss_weight > 0 else None,
-                mse_loss_fn=mse_loss if mse_loss_weight > 0 else None)
-        train_accs, val_accs, test_accs = evaluate(merged_model, models, source_metadata, datasets, masks)
+                mse_loss_fn=mse_loss if mse_loss_weight > 0 else None,
+                kl_loss_fn=kl_loss if kl_loss_weight > 0 else None)
+        train_scores, val_scores, test_scores, aux_metrics = evaluate(
+            merged_model,
+            models,
+            source_metadata,
+            datasets,
+            masks,
+            source_tasks,
+        )
 
         # ---- internal logs (unchanged) ----
         for i, loss in enumerate(train_losses):
@@ -670,6 +711,9 @@ def merge_model(
             logs[f"val_acc_{i}"].append(val_acc.item())
         for i, test_acc in enumerate(test_accs):
             logs[f"test_acc_{i}"].append(test_acc.item())
+        if kl_loss_weight > 0:
+            for i, loss in enumerate(kl_losses):
+                logs[f"train_kl_loss_{i}"].append(loss)
         logs["grad_norm_total"].append(grad_norms["total"])
 
         # ---- wandb logging ----
@@ -696,6 +740,10 @@ def merge_model(
                         wb_log[f"{prefix}/train_contrastive_loss/{layer_name}"] = loss
                 wb_log["contrastive/logit_scale"] = siglip.logit_scale.detach().item()
                 wb_log["contrastive/logit_bias"] = siglip.logit_bias.detach().item()
+            if kl_loss_weight > 0:
+                for layer_idx, (layer_name, loss) in enumerate(zip(layer_names, kl_losses)):
+                    for i, prefix in enumerate(model_prefixes):
+                        wb_log[f"{prefix}/train_kl_loss/{layer_name}"] = loss
 
             # Grad norms — logged under grad_norm/<param_name> and grad_norm/total
             # These belong to the merged model, not to any individual source model,
@@ -760,8 +808,15 @@ if __name__ == '__main__':
     parser.add_argument("--lr", type=float, default=DEFAULT_LR, help="learning rate")
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WD, help="weight decay")
     parser.add_argument("--save-path", type=Path, help="where to save the merged model")
-    parser.add_argument("--mse-loss-weight", type=float, help='how much to weigh mse loss?')
-    parser.add_argument("--contrastive-loss-weight", type=float, help='how much to weigh contrastive loss?')
+    parser.add_argument("--mse-loss-weight", type=float, default=1.0, help='how much to weigh mse loss?')
+    parser.add_argument("--contrastive-loss-weight", type=float, default=0.0, help='how much to weigh contrastive loss?')
+    parser.add_argument("--kl-loss-weight", type=float, default=0.0, help="how much to weigh KL divergence loss?")
+    parser.add_argument(
+        "--kl-temperature",
+        type=float,
+        default=DEFAULT_KL_TEMPERATURE,
+        help="temperature for KL divergence over feature distributions",
+    )
     parser.add_argument("--subsample-ratio", type=float, default=1.0, help="how many of each class to (sub)sample?")
     parser.add_argument(
         "--subsample-mode",
@@ -912,6 +967,8 @@ if __name__ == '__main__':
         soft_label_temperature=args.soft_label_temperature,
         mse_loss_weight=args.mse_loss_weight,
         contrastive_loss_weight=args.contrastive_loss_weight,
+        kl_loss_weight=args.kl_loss_weight,
+        kl_temperature=args.kl_temperature,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         seed=args.seed,
