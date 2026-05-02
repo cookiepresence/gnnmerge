@@ -187,7 +187,7 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(description="Train a GNN backbone for link prediction.")
     p.add_argument("--dataset", required=True, help="Name of the dataset")
-    p.add_argument("--model", required=True, choices=["gcn", "sage"], help="Backbone architecture")
+    p.add_argument("--model", required=True, choices=["gcn", "sage", "gat", "gin"], help="Backbone architecture")
     p.add_argument("--data-path", required=True, type=Path, help="Path to dataset file (torch .pt)")
     p.add_argument("--save-path", required=True, type=Path, help="Checkpoint directory")
     p.add_argument("--num-epochs", type=int, default=NUM_EPOCHS, help="Number of training epochs")

@@ -243,7 +243,7 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(description="Train node-classification models on datasets that are split by number of labels. Each model only sees a subset of the labels, instead of seeing the entire dataset. The number of splits is given by --num-classes, and all labels are split (nearly) evenly across all classes to prevent data imbalance. If the number of splits is 1, it is assumed that you want to train on the entire dataset.")
     p.add_argument("--dataset", required=True, help="Name of the dataset (used for logging filenames)")
-    p.add_argument("--model", required=True, choices=["gcn", "sage"], help="Backbone architecture")
+    p.add_argument("--model", required=True, choices=["gcn", "sage", "gat", "gin"], help="Backbone architecture")
     p.add_argument("--data-path", required=True, type=Path, help="Path to dataset file (torch .pt)")
     p.add_argument("--save-path", required=True, type=Path, help="Checkpoint path for model 1")
     p.add_argument("--num-classes", type=int, default=1, help="number of ways the dataset is split")

@@ -75,20 +75,55 @@ def pad_model_first_layer(model, current_dim: int, target_dim: int, backbone_att
 
     padding_size = target_dim - current_dim
 
-    if hasattr(first_layer, 'lin'):
-        old_weight = first_layer.lin.weight.data
+    def pad_linear(linear):
+        if linear is None:
+            return
+        old_weight = linear.weight.data
         weight_padding = torch.zeros(old_weight.shape[0], padding_size,
                                      dtype=old_weight.dtype, device=old_weight.device)
-        first_layer.lin.weight.data = torch.cat([old_weight, weight_padding], dim=1)
+        linear.weight.data = torch.cat([old_weight, weight_padding], dim=1)
+        if hasattr(linear, "in_features"):
+            linear.in_features = target_dim
+        if hasattr(linear, "in_channels") and isinstance(getattr(linear, "in_channels"), int):
+            linear.in_channels = target_dim
+
+    def pad_first_matching_child(module: torch.nn.Module) -> bool:
+        for child in module.children():
+            if hasattr(child, "weight") and child.weight is not None and child.weight.dim() == 2:
+                if int(child.weight.size(1)) == current_dim:
+                    pad_linear(child)
+                    return True
+        return False
+
+    if hasattr(first_layer, 'lin'):
+        seen: set[int] = set()
+        for attr in ("lin", "lin_src", "lin_dst"):
+            linear = getattr(first_layer, attr, None)
+            if linear is not None and id(linear) not in seen:
+                pad_linear(linear)
+                seen.add(id(linear))
+        if hasattr(first_layer, 'in_channels'):
+            first_layer.in_channels = target_dim
+        logger.info(f"Padded model '{first_layer_name}' layer from {current_dim} to {target_dim}")
+
+    elif hasattr(first_layer, "nn") and isinstance(first_layer.nn, torch.nn.Module):
+        if not pad_first_matching_child(first_layer.nn):
+            raise ValueError(f"Could not find a pad-able linear child in {first_layer_name}")
+        logger.info(f"Padded model '{first_layer_name}' layer from {current_dim} to {target_dim}")
+
+    elif hasattr(first_layer, 'lin_l'):
+        seen: set[int] = set()
+        for attr in ("lin_l", "lin_r"):
+            linear = getattr(first_layer, attr, None)
+            if linear is not None and id(linear) not in seen:
+                pad_linear(linear)
+                seen.add(id(linear))
         if hasattr(first_layer, 'in_channels'):
             first_layer.in_channels = target_dim
         logger.info(f"Padded model '{first_layer_name}' layer from {current_dim} to {target_dim}")
 
     elif isinstance(first_layer, torch.nn.Linear):
-        old_weight = first_layer.weight.data
-        weight_padding = torch.zeros(old_weight.shape[0], padding_size,
-                                     dtype=old_weight.dtype, device=old_weight.device)
-        first_layer.weight.data = torch.cat([old_weight, weight_padding], dim=1)
+        pad_linear(first_layer)
         first_layer.in_features = target_dim
         logger.info(f"Padded model Linear layer from {current_dim} to {target_dim}")
     else:
@@ -116,6 +151,84 @@ def is_link_prediction(meta: dict[str, Any]) -> bool:
 
 def source_backbone(model: torch.nn.Module) -> torch.nn.Module:
     return getattr(model, "backbone", model)
+
+
+def pad_last_dim(tensor: torch.Tensor, target_dim: int) -> torch.Tensor:
+    current_dim = int(tensor.size(-1))
+    if current_dim == target_dim:
+        return tensor
+    if current_dim > target_dim:
+        raise ValueError(f"Cannot pad tensor with dim {current_dim} down to {target_dim}")
+    padding = torch.zeros(
+        *tensor.shape[:-1],
+        target_dim - current_dim,
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    return torch.cat([tensor, padding], dim=-1)
+
+
+def conv_input_dim(layer: torch.nn.Module) -> int:
+    if hasattr(layer, "lin") and hasattr(layer.lin, "weight"):
+        return int(layer.lin.weight.size(1))
+    if hasattr(layer, "lin_l") and hasattr(layer.lin_l, "weight"):
+        return int(layer.lin_l.weight.size(1))
+    if hasattr(layer, "lin_src") and hasattr(layer.lin_src, "weight"):
+        return int(layer.lin_src.weight.size(1))
+    for child in layer.modules():
+        if child is layer:
+            continue
+        if hasattr(child, "weight") and child.weight is not None and child.weight.dim() == 2:
+            return int(child.weight.size(1))
+    raise ValueError(f"Could not infer input dim for layer {layer.__class__.__name__}")
+
+
+def conv_output_dim(layer: torch.nn.Module) -> int:
+    if hasattr(layer, "out_channels") and hasattr(layer, "heads") and hasattr(layer, "concat"):
+        out_channels = int(layer.out_channels)
+        heads = int(layer.heads)
+        return out_channels * heads if bool(layer.concat) else out_channels
+    if hasattr(layer, "lin") and hasattr(layer.lin, "weight"):
+        return int(layer.lin.weight.size(0))
+    if hasattr(layer, "lin_l") and hasattr(layer.lin_l, "weight"):
+        return int(layer.lin_l.weight.size(0))
+    if hasattr(layer, "lin_dst") and hasattr(layer.lin_dst, "weight"):
+        return int(layer.lin_dst.weight.size(0))
+    linears = [
+        child for child in layer.modules()
+        if child is not layer and hasattr(child, "weight") and child.weight is not None and child.weight.dim() == 2
+    ]
+    if linears:
+        return int(linears[-1].weight.size(0))
+    raise ValueError(f"Could not infer output dim for layer {layer.__class__.__name__}")
+
+
+def pad_layer_inputs(inputs: tuple, target_dim: int) -> tuple:
+    if not inputs:
+        return inputs
+    padded = list(inputs)
+    if isinstance(padded[0], torch.Tensor):
+        padded[0] = pad_last_dim(padded[0], target_dim)
+    return tuple(padded)
+
+
+def head_input_dim(head: torch.nn.Module) -> int:
+    if hasattr(head, "mlp") and hasattr(head.mlp, "weight"):
+        return int(head.mlp.weight.size(1))
+    for param in head.parameters():
+        if param.dim() >= 2:
+            return int(param.size(1))
+    raise ValueError(f"Could not infer input dim for head {head.__class__.__name__}")
+
+
+class HeadInputAdapter(torch.nn.Module):
+    def __init__(self, head: torch.nn.Module) -> None:
+        super().__init__()
+        self.head = head
+        self.input_dim = head_input_dim(head)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(pad_last_dim(x[..., :min(x.size(-1), self.input_dim)], self.input_dim))
 
 
 make_inductive_subgraph = utils.make_inductive_subgraph
@@ -567,27 +680,45 @@ def train(
     contrastive_losses = []
     kl_losses = []
 
-    for layer in model_outputs[0].keys():
-        model_output = [outputs[layer] for outputs in model_outputs]
-        model_input  = [inputs[layer]  for inputs  in model_inputs]
+    for layer, merged_model_layer in merged_model.named_children():
+        source_indices = [
+            idx
+            for idx, (outputs, inputs) in enumerate(zip(model_outputs, model_inputs))
+            if layer in outputs and layer in inputs
+        ]
+        if not source_indices:
+            continue
 
-        merged_model_layer   = getattr(merged_model, layer)
+        input_dim = conv_input_dim(merged_model_layer)
+        output_dim = conv_output_dim(merged_model_layer)
+        model_output = [
+            pad_last_dim(model_outputs[idx][layer], output_dim)
+            for idx in source_indices
+        ]
+        model_input = [
+            pad_layer_inputs(model_inputs[idx][layer], input_dim)
+            for idx in source_indices
+        ]
+        layer_masks = [masks[idx] for idx in source_indices]
+
         merged_model_outputs = [merged_model_layer(*inp) for inp in model_input]
 
-        loss = criterion(merged_model_outputs, model_output, masks)
+        loss = criterion(merged_model_outputs, model_output, layer_masks)
         losses.append(loss)
 
         if mse_loss_fn is not None:
             with torch.no_grad():
-                mse_losses.append(mse_loss_fn(merged_model_outputs, model_output, masks).item())
+                mse_losses.append(mse_loss_fn(merged_model_outputs, model_output, layer_masks).item())
         if contrastive_loss_fn is not None:
             with torch.no_grad():
-                contrastive_losses.append(contrastive_loss_fn(merged_model_outputs, model_output, masks).item())
+                contrastive_losses.append(contrastive_loss_fn(merged_model_outputs, model_output, layer_masks).item())
         if kl_loss_fn is not None:
             with torch.no_grad():
-                kl_losses.append(kl_loss_fn(merged_model_outputs, model_output, masks).item())
+                kl_losses.append(kl_loss_fn(merged_model_outputs, model_output, layer_masks).item())
 
     # [loss.backward() for loss in losses]
+    if not losses:
+        raise ValueError("No matching layers found between source models and merged model")
     torch.stack(losses).sum().backward()
     grad_norms = compute_grad_norms(merged_model)
     optimizer.step()
@@ -656,7 +787,7 @@ def evaluate(
         elif task == str(utils.Task.NodeClassification):
             metrics = task_evaluation.evaluate_node_classification(
                 merged_model,
-                model.mlp,
+                HeadInputAdapter(model.mlp),
                 datasets[metadata_dataset_key(meta)],
                 mask,
             )
@@ -693,6 +824,10 @@ def merge_model(
         training_mode: str = DEFAULT_TRAINING_MODE,
         subsample_mode: str = SubsampleMode.GT_CLASS_STRATIFIED_RANDOM.value,
         soft_label_temperature: float = DEFAULT_SOFT_LABEL_TEMPERATURE,
+        student_model_type: Optional[str] = None,
+        student_input_dim: Optional[int] = None,
+        student_hidden_dim: Optional[int] = None,
+        student_num_layers: Optional[int] = None,
         wandb_project: Optional[str] = None,
         wandb_run_name: Optional[str] = None,
 ):
@@ -705,15 +840,24 @@ def merge_model(
     source_tasks = [metadata_task(meta) for meta in source_metadata]
     source_is_lp = [task == str(utils.Task.LinkPrediction) for task in source_tasks]
     source_metrics = ["auc" if is_lp else "acc" for is_lp in source_is_lp]
+    if student_model_type is None:
+        student_model_type = source_metadata[0]['model_type']
+    if student_input_dim is None:
+        student_input_dim = max(int(meta["input_dim"]) for meta in source_metadata)
+    if student_hidden_dim is None:
+        student_hidden_dim = max(int(meta["hidden_dim"]) for meta in source_metadata)
+    if student_num_layers is None:
+        student_num_layers = max(int(meta.get("num_layers", 2)) for meta in source_metadata)
     models: list[torch.nn.Module] = [model.eval() for model, _ in models]
     with torch.no_grad():
-        teacher_outputs = [
+        raw_teacher_outputs = [
             source_backbone(model)(datasets[metadata_dataset_key(metadata)]).detach()
             for model, metadata in zip(models, source_metadata)
         ]
+        teacher_outputs = [pad_last_dim(output, student_hidden_dim) for output in raw_teacher_outputs]
         parent_soft_labels = []
         for model_idx, (model, is_lp, output, meta) in enumerate(
-            zip(models, source_is_lp, teacher_outputs, source_metadata)
+            zip(models, source_is_lp, raw_teacher_outputs, source_metadata)
         ):
             if is_lp:
                 lp_soft_labels = make_link_prediction_soft_labels(
@@ -768,10 +912,11 @@ def merge_model(
         "lr": learning_rate,
         "epochs": num_epochs,
         "seed": seed,
-        "model_type": source_metadata[0]['model_type'],
-        "input_dim": source_metadata[0]['input_dim'],
-        "hidden_dim": source_metadata[0]['hidden_dim'],
-        "num_layers": source_metadata[0].get('num_layers', 2),
+        "model_type": student_model_type,
+        "input_dim": student_input_dim,
+        "hidden_dim": student_hidden_dim,
+        "output_dim": student_hidden_dim,
+        "num_layers": student_num_layers,
         "mse_loss_weight": mse_loss_weight,
         "contrastive_loss_weight": contrastive_loss_weight,
         "kl_loss_weight": kl_loss_weight,
@@ -932,7 +1077,7 @@ def merge_model(
             f"{meta['dataset']}/{task}/{meta.get('chosen_class')}/{meta.get('num_classes')}"
             for task, meta in zip(source_tasks, source_metadata)
         ]
-        layer_names = list(model_outputs[0].keys()) if training_mode == "layerwise" else ["final"]
+        layer_names = [name for name, _ in merged_model.named_children()] if training_mode == "layerwise" else ["final"]
         logger.info("wandb run initialised — prefixes: %s", model_prefixes)
 
     def criterion(merged_model_outputs, model_output, masks):
@@ -1058,27 +1203,38 @@ def merge_model(
     if use_wandb:
         wandb.finish()
 
-def build_merged_model(models, max_input_dim: int) -> torch.nn.Module:
-    model_type: list[str] = [metadata['model_type'] for _, metadata in models]
-    hidden_dims: list[int] = [metadata['hidden_dim'] for _, metadata in models]
-    num_layers: list[int] = [int(metadata.get('num_layers', 2)) for _, metadata in models]
-    assert all([m == model_type[0] for m in model_type])
-    assert all([dim == hidden_dims[0] for dim in hidden_dims])
-    assert all([nl == num_layers[0] for nl in num_layers])
-
-    hidden_dim = hidden_dims[0]
+def build_merged_model(
+    max_input_dim: int,
+    student_model_type: str,
+    student_hidden_dim: int,
+    student_num_layers: int,
+) -> torch.nn.Module:
     return utils.build_model(
-        model_name=model_type[0],
+        model_name=student_model_type,
         input_dim=max_input_dim,
         num_labels=None,
         device=utils.get_device(),
-        hidden_dim=hidden_dim,
-        num_layers=num_layers[0],
+        hidden_dim=student_hidden_dim,
+        num_layers=student_num_layers,
     )
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="apply gnn merge on models")
     parser.add_argument("--model-path", action="append", type=Path, help="path for models to be merged")
+    parser.add_argument(
+        "--student-model",
+        choices=["gcn", "sage", "gat", "gin"],
+        default=None,
+        help="Student/merged architecture. Defaults to the first parent model architecture.",
+    )
+    parser.add_argument(
+        "--hidden-dim",
+        "--student-hidden-dim",
+        dest="student_hidden_dim",
+        type=int,
+        default=None,
+        help="Student/merged hidden dimension. Defaults to the maximum parent hidden dimension.",
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="model seed")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR, help="learning rate")
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WD, help="weight decay")
@@ -1109,9 +1265,11 @@ if __name__ == '__main__':
     parser.add_argument("--num-epochs", type=int, default=DEFAULT_EPOCHS, help="number of merge training epochs")
     parser.add_argument(
         "--num-layers",
+        "--student-num-layers",
+        dest="student_num_layers",
         type=int,
         default=None,
-        help="number of GNN conv layers in the source checkpoints; inferred from metadata when omitted",
+        help="Student/merged GNN conv layers. Defaults to the maximum parent layer count.",
     )
     parser.add_argument(
         "--training-mode",
@@ -1142,13 +1300,17 @@ if __name__ == '__main__':
 
     models = [utils.load_models(path, task=utils.Task.NodeClassification, device=device) for path in args.model_path]
     source_model_metadata = [metadata for _, metadata in models]
-    source_num_layers = int(source_model_metadata[0].get("num_layers", 2))
-    if args.num_layers is not None and args.num_layers != source_num_layers:
+    student_model_type = args.student_model or source_model_metadata[0]['model_type']
+    source_hidden_dims = [int(meta["hidden_dim"]) for meta in source_model_metadata]
+    source_num_layers = [int(meta.get("num_layers", 2)) for meta in source_model_metadata]
+    student_hidden_dim = args.student_hidden_dim or max(source_hidden_dims)
+    student_num_layers = args.student_num_layers or max(source_num_layers)
+    if student_hidden_dim < max(source_hidden_dims):
         raise ValueError(
-            f"Requested num_layers={args.num_layers} does not match source checkpoints ({source_num_layers})"
+            f"student hidden_dim={student_hidden_dim} must be >= max source hidden_dim={max(source_hidden_dims)}"
         )
-    if any(int(meta.get("num_layers", 2)) != source_num_layers for meta in source_model_metadata):
-        raise ValueError("All source models must have the same num_layers")
+    if student_num_layers < 2:
+        raise ValueError("student num_layers must be >= 2")
 
     dataset_names: list[str] = [metadata['dataset'] for metadata in source_model_metadata]
     datasets: dict[str, Any] = {
@@ -1258,7 +1420,19 @@ if __name__ == '__main__':
 
     models = final_models
 
-    merged_model = build_merged_model(models, max_input_dim)
+    logger.info(
+        "Student model: type=%s input_dim=%d hidden_dim=%d num_layers=%d",
+        student_model_type,
+        max_input_dim,
+        student_hidden_dim,
+        student_num_layers,
+    )
+    merged_model = build_merged_model(
+        max_input_dim,
+        student_model_type,
+        student_hidden_dim,
+        student_num_layers,
+    )
 
     merge_model(
         merged_model,
@@ -1278,6 +1452,10 @@ if __name__ == '__main__':
         seed=args.seed,
         num_epochs=args.num_epochs,
         training_mode=args.training_mode,
+        student_model_type=student_model_type,
+        student_input_dim=max_input_dim,
+        student_hidden_dim=student_hidden_dim,
+        student_num_layers=student_num_layers,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
     )

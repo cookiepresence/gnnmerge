@@ -30,7 +30,7 @@ class Task(enum.StrEnum):
     LinkPrediction = 'Link Prediction'
 
 def build_model(
-        model_name: Literal['gcn', 'sage'],
+        model_name: Literal['gcn', 'sage', 'gat', 'gin'],
         input_dim: int,
         num_labels: Optional[int],
         device: torch.device,
@@ -41,6 +41,10 @@ def build_model(
         backbone = models.GCNBackbone(input_dim, hidden_dim, num_layers=num_layers).to(device)
     elif model_name == 'sage':
         backbone = models.SageBackbone(input_dim, hidden_dim, num_layers=num_layers).to(device)
+    elif model_name == 'gat':
+        backbone = models.GATBackbone(input_dim, hidden_dim, num_layers=num_layers).to(device)
+    elif model_name == 'gin':
+        backbone = models.GINBackbone(input_dim, hidden_dim, num_layers=num_layers).to(device)
     else:
         raise ValueError(f"Unknown model type: {model_name!r}")
 
