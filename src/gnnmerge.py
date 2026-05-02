@@ -145,9 +145,6 @@ def metadata_task(meta: dict[str, Any]) -> str:
     return str(meta.get("task", utils.Task.NodeClassification))
 
 
-def is_link_prediction(meta: dict[str, Any]) -> bool:
-    return metadata_task(meta) == str(utils.Task.LinkPrediction)
-
 
 def source_backbone(model: torch.nn.Module) -> torch.nn.Module:
     return getattr(model, "backbone", model)
@@ -491,159 +488,6 @@ def _binary_entropy(probs: torch.Tensor) -> torch.Tensor:
     return -(probs * probs.log() + (1.0 - probs) * (1.0 - probs).log())
 
 
-def make_link_prediction_soft_labels(
-        model: torch.nn.Module,
-        data,
-        embeddings: torch.Tensor,
-        seed: int,
-) -> dict[str, torch.Tensor]:
-    pos_edge_index = data.edge_label_index[:, data.edge_label == 1]
-    if pos_edge_index.numel() == 0:
-        empty = torch.empty(0, dtype=torch.long, device=embeddings.device)
-        return {
-            "edge_index": torch.empty((2, 0), dtype=torch.long, device=embeddings.device),
-            "hard_labels": empty.float(),
-            "soft_labels": empty.float(),
-        }
-
-    rng_state = torch.random.get_rng_state()
-    cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    try:
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-        neg_edge_index = negative_sampling(
-            edge_index=data.edge_index,
-            num_nodes=data.num_nodes,
-            num_neg_samples=pos_edge_index.size(1),
-        )
-    finally:
-        torch.random.set_rng_state(rng_state)
-        if cuda_rng_state is not None:
-            torch.cuda.set_rng_state_all(cuda_rng_state)
-
-    edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=1)
-    hard_labels = torch.cat([
-        torch.ones(pos_edge_index.size(1), dtype=torch.float32, device=embeddings.device),
-        torch.zeros(neg_edge_index.size(1), dtype=torch.float32, device=embeddings.device),
-    ])
-    soft_labels = model.decode(embeddings, edge_index).sigmoid().detach()
-    return {
-        "edge_index": edge_index.detach(),
-        "hard_labels": hard_labels.detach(),
-        "soft_labels": soft_labels,
-    }
-
-
-def _link_prediction_all_edge_indices(edge_index: torch.Tensor) -> torch.Tensor:
-    return torch.arange(edge_index.size(1), device=edge_index.device)
-
-
-def _subsample_link_prediction_edges_class_stratified(
-        hard_labels: torch.Tensor,
-        ratio: float,
-        generator: torch.Generator,
-        score_fn=None,
-        temperature: float = DEFAULT_SOFT_LABEL_TEMPERATURE,
-) -> torch.Tensor:
-    all_idx = torch.arange(hard_labels.numel(), device=hard_labels.device)
-    if ratio >= 1.0:
-        return all_idx
-
-    selected_parts = []
-    for label in hard_labels.unique():
-        idx = (hard_labels == label).nonzero(as_tuple=False).view(-1)
-        if idx.numel() == 0:
-            continue
-        scores = score_fn(idx) if score_fn is not None else None
-        selected_parts.append(
-            _sample_from_indices(
-                idx,
-                _compute_subsample_k(idx.numel(), ratio),
-                generator,
-                scores=scores,
-                temperature=temperature,
-            )
-        )
-    return torch.cat(selected_parts) if selected_parts else all_idx[:0]
-
-
-def subsample_link_prediction_edges_random_global(
-        edge_index: torch.Tensor,
-        ratio: float,
-        generator: torch.Generator,
-) -> torch.Tensor:
-    # LP analogue of random node sampling: sample uniformly from all candidate edges.
-    idx = _link_prediction_all_edge_indices(edge_index)
-    if ratio >= 1.0:
-        return idx
-    return _sample_from_indices(idx, _compute_subsample_k(idx.numel(), ratio), generator)
-
-
-def subsample_link_prediction_edges_gt_class_stratified_random(
-        hard_labels: torch.Tensor,
-        ratio: float,
-        generator: torch.Generator,
-) -> torch.Tensor:
-    # LP "classes" are positive and negative candidate edges.
-    return _subsample_link_prediction_edges_class_stratified(hard_labels, ratio, generator)
-
-
-def subsample_link_prediction_edges_parent_soft_label_class_stratified(
-        hard_labels: torch.Tensor,
-        soft_labels: torch.Tensor,
-        ratio: float,
-        generator: torch.Generator,
-        soft_label_temperature: float = DEFAULT_SOFT_LABEL_TEMPERATURE,
-) -> torch.Tensor:
-    if soft_label_temperature <= 0:
-        raise ValueError("soft_label_temperature must be > 0")
-
-    def score_fn(idx: torch.Tensor) -> torch.Tensor:
-        # soft_labels are p(edge exists | u, v). For negative candidates,
-        # confidence in the hard edge class is 1 - p(edge exists | u, v).
-        return torch.where(hard_labels[idx] > 0.5, soft_labels[idx], 1.0 - soft_labels[idx])
-
-    return _subsample_link_prediction_edges_class_stratified(
-        hard_labels,
-        ratio,
-        generator,
-        score_fn=score_fn,
-        temperature=soft_label_temperature,
-    )
-
-
-def subsample_link_prediction_edges_parent_entropy_class_stratified(
-        hard_labels: torch.Tensor,
-        soft_labels: torch.Tensor,
-        ratio: float,
-        generator: torch.Generator,
-        soft_label_temperature: float = DEFAULT_SOFT_LABEL_TEMPERATURE,
-) -> torch.Tensor:
-    if soft_label_temperature <= 0:
-        raise ValueError("soft_label_temperature must be > 0")
-    entropy = _binary_entropy(soft_labels)
-    return _subsample_link_prediction_edges_class_stratified(
-        hard_labels,
-        ratio,
-        generator,
-        score_fn=lambda idx: entropy[idx],
-        temperature=soft_label_temperature,
-    )
-
-
-def link_prediction_edges_to_node_mask(
-        train_mask: torch.Tensor,
-        edge_index: torch.Tensor,
-        selected_edges: torch.Tensor,
-) -> torch.Tensor:
-    node_mask = torch.zeros_like(train_mask, dtype=torch.bool)
-    if selected_edges.numel() > 0:
-        selected_nodes = edge_index[:, selected_edges].reshape(-1).unique()
-        node_mask[selected_nodes] = True
-        node_mask &= train_mask
-    return node_mask
-
 def compute_grad_norms(model: torch.nn.Module) -> dict[str, float]:
     """
     Compute per-parameter and total L2 gradient norms for a model.
@@ -777,28 +621,15 @@ def evaluate(
     aux_metrics: dict[str, list[float]] = collections.defaultdict(list)
 
     for i, (model, meta, mask, task) in enumerate(zip(models, metadata, masks, source_tasks)):
-        if task == str(utils.Task.LinkPrediction):
-            metrics = task_evaluation.evaluate_link_prediction_splits(
-                merged_model,
-                datasets[metadata_dataset_key(meta)],
-                datasets[meta["link_val_dataset_key"]],
-                datasets[meta["link_test_dataset_key"]],
-            )
-        elif task == str(utils.Task.NodeClassification):
-            metrics = task_evaluation.evaluate_node_classification(
-                merged_model,
-                HeadInputAdapter(model.mlp),
-                datasets[metadata_dataset_key(meta)],
-                mask,
-            )
-        else:
-            raise ValueError(f"Unsupported task for evaluation: {task}")
-
+        metrics = task_evaluation.evaluate_node_classification(
+            merged_model,
+            HeadInputAdapter(model.mlp),
+            datasets[metadata_dataset_key(meta)],
+            mask,
+        )
         train_scores.append(torch.tensor(metrics.train, device=utils.get_device()))
         val_scores.append(torch.tensor(metrics.val, device=utils.get_device()))
         test_scores.append(torch.tensor(metrics.test, device=utils.get_device()))
-        for name, value in getattr(metrics, "aux", {}).items():
-            aux_metrics[f"{name}_{i}"].append(value)
 
     return (
         torch.stack(train_scores).to(utils.get_device()),
@@ -838,8 +669,6 @@ def merge_model(
 
     source_metadata: list[dict] = [metadata for _, metadata in models]
     source_tasks = [metadata_task(meta) for meta in source_metadata]
-    source_is_lp = [task == str(utils.Task.LinkPrediction) for task in source_tasks]
-    source_metrics = ["auc" if is_lp else "acc" for is_lp in source_is_lp]
     if student_model_type is None:
         student_model_type = source_metadata[0]['model_type']
     if student_input_dim is None:
@@ -855,20 +684,8 @@ def merge_model(
             for model, metadata in zip(models, source_metadata)
         ]
         teacher_outputs = [pad_last_dim(output, student_hidden_dim) for output in raw_teacher_outputs]
-        parent_soft_labels = []
-        for model_idx, (model, is_lp, output, meta) in enumerate(
-            zip(models, source_is_lp, raw_teacher_outputs, source_metadata)
-        ):
-            if is_lp:
-                lp_soft_labels = make_link_prediction_soft_labels(
-                    model,
-                    datasets[metadata_dataset_key(meta)],
-                    output,
-                    seed + model_idx,
-                )
-                parent_soft_labels.append(lp_soft_labels)
-            else:
-                parent_soft_labels.append(torch.softmax(model.mlp(output), dim=1).detach())
+        parent_soft_labels = [torch.softmax(model.mlp(output), dim=1).detach() for output in raw_teacher_outputs]
+
     model_outputs = []
     model_inputs = []
     if training_mode == "layerwise":
@@ -878,8 +695,8 @@ def merge_model(
         raise ValueError(f"Unknown training mode: {training_mode}")
     siglip = SigLIPLoss().to(utils.get_device()) if contrastive_loss_weight > 0 else None
     optimizer_params = list(merged_model.parameters())
-    if siglip is not None:
-        optimizer_params.extend(siglip.parameters())
+    # if siglip is not None:
+    #     optimizer_params.extend(siglip.parameters())
     optimizer = torch.optim.Adam(optimizer_params, lr=learning_rate, weight_decay=weight_decay)
 
     mse_loss = lambda merged_model_outputs, model_output, masks: torch.sum(
@@ -935,65 +752,15 @@ def merge_model(
 
     subsampled_masks = []
     sampling_stats: list[dict[str, Any]] = []
-    for (train_mask, val_mask, test_mask), soft_labels, meta, task, is_lp in zip(
+    for (train_mask, val_mask, test_mask), soft_labels, meta, task in zip(
         masks,
         parent_soft_labels,
         source_metadata,
         source_tasks,
-        source_is_lp,
     ):
         # ensure that all datasets are sampled with the same seed.
         gen = torch.Generator(device=utils.get_device())
         gen.manual_seed(seed)
-
-        if is_lp:
-            lp_edge_index = soft_labels["edge_index"]
-            lp_hard_labels = soft_labels["hard_labels"]
-            lp_soft_labels = soft_labels["soft_labels"]
-            if subsample_mode == SubsampleMode.GT_CLASS_STRATIFIED_RANDOM.value:
-                selected_edges = subsample_link_prediction_edges_gt_class_stratified_random(
-                    lp_hard_labels,
-                    subsample_ratio,
-                    gen,
-                )
-            elif subsample_mode == SubsampleMode.PARENT_SOFT_LABEL_CLASS_STRATIFIED.value:
-                selected_edges = subsample_link_prediction_edges_parent_soft_label_class_stratified(
-                    lp_hard_labels,
-                    lp_soft_labels,
-                    subsample_ratio,
-                    gen,
-                    soft_label_temperature=soft_label_temperature,
-                )
-            elif subsample_mode == SubsampleMode.RANDOM_GLOBAL.value:
-                selected_edges = subsample_link_prediction_edges_random_global(
-                    lp_edge_index,
-                    subsample_ratio,
-                    gen,
-                )
-            elif subsample_mode == SubsampleMode.PARENT_ENTROPY_CLASS_STRATIFIED.value:
-                selected_edges = subsample_link_prediction_edges_parent_entropy_class_stratified(
-                    lp_hard_labels,
-                    lp_soft_labels,
-                    subsample_ratio,
-                    gen,
-                    soft_label_temperature=soft_label_temperature,
-                )
-            else:
-                raise ValueError(f"Unknown subsample mode: {subsample_mode}")
-            sub_train = link_prediction_edges_to_node_mask(train_mask, lp_edge_index, selected_edges)
-            subsampled_masks.append((sub_train, val_mask, test_mask))
-            sampling_stats.append(
-                {
-                    "dataset": meta["dataset"],
-                    "task": task,
-                    "chosen_class": int(meta.get("chosen_class", 0)),
-                    "before": int(train_mask.sum().item()),
-                    "sampled": int(sub_train.sum().item()),
-                    "before_edges": int(lp_edge_index.size(1)),
-                    "sampled_edges": int(selected_edges.numel()),
-                }
-            )
-            continue
 
         labels = datasets[metadata_dataset_key(meta)].y
         # Dispatch exactly one strategy per source model; resulting sub_train keeps
@@ -1128,11 +895,11 @@ def merge_model(
             for i, loss in enumerate(kl_losses):
                 logs[f"train_kl_loss_{i}"].append(loss)
         for i, train_score in enumerate(train_scores):
-            logs[f"train_{source_metrics[i]}_{i}"].append(train_score.item())
+            logs[f"train_acc_{i}"].append(train_score.item())
         for i, val_score in enumerate(val_scores):
-            logs[f"val_{source_metrics[i]}_{i}"].append(val_score.item())
+            logs[f"val_acc_{i}"].append(val_score.item())
         for i, test_score in enumerate(test_scores):
-            logs[f"test_{source_metrics[i]}_{i}"].append(test_score.item())
+            logs[f"test_acc_{i}"].append(test_score.item())
         logs["grad_norm_total"].append(grad_norms["total"])
 
         # ---- wandb logging ----
@@ -1141,10 +908,9 @@ def merge_model(
 
             # Per-model task metrics, namespaced by dataset/task/split/total.
             for i, prefix in enumerate(model_prefixes):
-                metric = source_metrics[i]
-                wb_log[f"{prefix}/train_{metric}"] = train_scores[i].item()
-                wb_log[f"{prefix}/val_{metric}"] = val_scores[i].item()
-                wb_log[f"{prefix}/test_{metric}"] = test_scores[i].item()
+                wb_log[f"{prefix}/train_acc"] = train_scores[i].item()
+                wb_log[f"{prefix}/val_acc"] = val_scores[i].item()
+                wb_log[f"{prefix}/test_acc"] = test_scores[i].item()
 
             # Per-layer losses, also namespaced by dataset/split/total for each model
             for layer_idx, (layer_name, loss) in enumerate(zip(layer_names, train_losses)):
@@ -1350,51 +1116,26 @@ if __name__ == '__main__':
     final_models: list[tuple[torch.nn.Module, dict[str, Any]]] = []
     for model_idx, (model, metadata) in enumerate(models):
         dataset_name = metadata['dataset']
-        if is_link_prediction(metadata):
-            split_seed = int(metadata.get("link_split_seed", metadata.get("seed", args.seed)))
-            val_ratio = float(metadata.get("link_val_ratio", 0.05))
-            test_ratio = float(metadata.get("link_test_ratio", 0.1))
-            train_data, val_data, test_data = task_evaluation.make_link_split(
-                base_dataset_objs[dataset_name],
-                split_seed,
-                val_ratio,
-                test_ratio,
-            )
-            dataset_key = f"{dataset_name}__lp_train__model{model_idx}"
-            val_dataset_key = f"{dataset_name}__lp_val__model{model_idx}"
-            test_dataset_key = f"{dataset_name}__lp_test__model{model_idx}"
-            dataset_objs[dataset_key] = train_data.to(device)
-            dataset_objs[val_dataset_key] = val_data.to(device)
-            dataset_objs[test_dataset_key] = test_data.to(device)
+        if dataset_name not in all_masks:
+            masks = utils.make_label_masks(*(datasets[dataset_name][:-1]), num_classes=metadata['num_classes'])
+            all_masks[dataset_name] = masks
+        base_dataset_objs[dataset_name].y = datasets[dataset_name][0].y.to(device)
+        split_mask = all_masks[dataset_name][metadata['chosen_class']]
+        match split_mode:
+            case 'transductive':
+                dataset_key = dataset_name
+                if dataset_key not in dataset_objs:
+                    dataset_objs[dataset_key] = base_dataset_objs[dataset_name]
+            case 'inductive':
+                dataset_key = f"{dataset_name}__class{metadata['chosen_class']}__model{model_idx}"
+                split_data, split_mask = make_inductive_subgraph(
+                    base_dataset_objs[dataset_name],
+                    split_mask,
+                )
+                dataset_objs[dataset_key] = split_data
+            case _:
+                raise ValueError(f"Unknown split mode for node classification: {split_mode}")
 
-            metadata["link_val_dataset_key"] = val_dataset_key
-            metadata["link_test_dataset_key"] = test_dataset_key
-            num_nodes = int(dataset_objs[dataset_key].num_nodes)
-            split_mask = (
-                torch.ones(num_nodes, dtype=torch.bool, device=device),
-                torch.ones(num_nodes, dtype=torch.bool, device=device),
-                torch.ones(num_nodes, dtype=torch.bool, device=device),
-            )
-        else:
-            if dataset_name not in all_masks:
-                masks = utils.make_label_masks(*(datasets[dataset_name][:-1]), num_classes=metadata['num_classes'])
-                all_masks[dataset_name] = masks
-            base_dataset_objs[dataset_name].y = datasets[dataset_name][0].y.to(device)
-            split_mask = all_masks[dataset_name][metadata['chosen_class']]
-            match split_mode:
-                case 'transductive':
-                    dataset_key = dataset_name
-                    if dataset_key not in dataset_objs:
-                        dataset_objs[dataset_key] = base_dataset_objs[dataset_name]
-                case 'inductive':
-                    dataset_key = f"{dataset_name}__class{metadata['chosen_class']}__model{model_idx}"
-                    split_data, split_mask = make_inductive_subgraph(
-                        base_dataset_objs[dataset_name],
-                        split_mask,
-                    )
-                    dataset_objs[dataset_key] = split_data
-                case _:
-                    raise ValueError(f"Unknown split mode for node classification: {split_mode}")
 
         used_nodes, used_edges = graph_size(dataset_objs[dataset_key])
         logger.info(
