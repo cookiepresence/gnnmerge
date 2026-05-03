@@ -943,7 +943,8 @@ def merge_model(
             wandb.log(wb_log, step=epoch)
 
         # ---- checkpoint ----
-        if torch.all(val_scores > best_val_scores):
+        improvement = val_scores / best_val_scores - 1
+        if improvement.sum() > 0:
             best_val_scores = val_scores.clone()
             aux_state = {"contrastive_head": siglip.state_dict()} if siglip is not None else None
             save(save_path, merged_model, None, None, logs, aux_state=aux_state)
