@@ -36,15 +36,15 @@ logger = logging.getLogger("gnn-merge")
 
 class SubsampleMode(enum.StrEnum):
     # Keep roughly ratio-per-class from true labels, sampled uniformly within each class.
-    GT_CLASS_STRATIFIED_RANDOM = "gt_class_stratified_random"
+    GT_CLASS_STRATIFIED_RANDOM = "hardlabel-class-stratified"
     # Keep ratio-per-class from true labels, but bias picks toward parent confidence
     # for that same class (soft_labels[node, class]).
-    PARENT_SOFT_LABEL_CLASS_STRATIFIED = "parent_soft_label_class_stratified"
+    PARENT_SOFT_LABEL_CLASS_STRATIFIED = "softlabel-class-stratified"
     # Ignore class balance and sample globally from all train nodes.
-    RANDOM_GLOBAL = "random_global"
+    RANDOM_GLOBAL = "random"
     # Keep ratio-per-class from true labels, but bias picks toward high-entropy
     # parent predictions (more uncertain examples).
-    PARENT_ENTROPY_CLASS_STRATIFIED = "parent_entropy_class_stratified"
+    PARENT_ENTROPY_CLASS_STRATIFIED = "entropy-class-stratified"
 
 
 def pad_dataset_features(data, target_dim: int):
